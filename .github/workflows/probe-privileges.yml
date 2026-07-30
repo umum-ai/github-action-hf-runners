@@ -209,16 +209,38 @@ jobs:
           LOG=/tmp/dockerd-rootful.log
           : > "$LOG"
 
+          # sudo resets PATH to secure_path, which does not contain the mise
+          # shim directory the docker bundle lives behind, and the shims
+          # themselves resolve through $HOME. Hand sudo the real binaries.
+          echo "== resolving real binaries behind the mise shims =="
+          mkdir -p /tmp/dockerbin
+          for b in dockerd docker containerd containerd-shim-runc-v2 runc \
+                   docker-init docker-proxy ctr; do
+            real=$(mise which "$b" 2>/dev/null)
+            if [ -n "$real" ] && [ -x "$real" ]; then
+              ln -sf "$real" "/tmp/dockerbin/$b"
+              echo "${b} -> ${real}"
+            else
+              echo "${b}: <unresolved>"
+            fi
+          done
+          ls -l /tmp/dockerbin 2>&1
+          export PATH="/tmp/dockerbin:$PATH"
+          echo "dockerd resolves to: $(command -v dockerd)"
+
           echo "== launching dockerd =="
           if sudo -n true </dev/null 2>/dev/null; then
             echo "using: sudo dockerd"
-            sudo -n nohup dockerd --host=unix:///var/run/docker.sock \
-              --storage-driver=vfs --iptables=false --bridge=none \
+            sudo -n env "PATH=/tmp/dockerbin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
+              /tmp/dockerbin/dockerd --host=unix:///var/run/docker.sock \
+              --storage-driver=vfs --iptables=false --ip6tables=false --bridge=none \
+              --debug \
               >>"$LOG" 2>&1 </dev/null &
           else
             echo "using: dockerd (no sudo available)"
-            nohup dockerd --host=unix:///var/run/docker.sock \
-              --storage-driver=vfs --iptables=false --bridge=none \
+            nohup /tmp/dockerbin/dockerd --host=unix:///var/run/docker.sock \
+              --storage-driver=vfs --iptables=false --ip6tables=false --bridge=none \
+              --debug \
               >>"$LOG" 2>&1 </dev/null &
           fi
           DPID=$!
@@ -227,7 +249,7 @@ jobs:
           echo "== waiting up to 30s for docker info =="
           ok=no
           for i in $(seq 1 30); do
-            if sudo -n docker info </dev/null >/tmp/docker-info.txt 2>/tmp/docker-info.err \
+            if sudo -n /tmp/dockerbin/docker info </dev/null >/tmp/docker-info.txt 2>/tmp/docker-info.err \
                || docker info >/tmp/docker-info.txt 2>/tmp/docker-info.err; then
               ok=yes
               echo "docker info succeeded after ${i}s"
@@ -241,6 +263,14 @@ jobs:
           cat /tmp/docker-info.txt 2>&1 | head -60
           echo "--- docker info stderr ---"
           cat /tmp/docker-info.err 2>&1 | head -30
+
+          echo "== if the daemon answered, can it actually run a container? =="
+          if [ "$ok" = yes ]; then
+            sudo -n /tmp/dockerbin/docker run --rm hello-world </dev/null 2>&1 | tail -20
+            echo "docker run rc=$?"
+          else
+            echo "skipped: daemon never answered"
+          fi
 
           echo "== dockerd log (tail 120) =="
           tail -120 "$LOG" 2>&1
@@ -309,14 +339,30 @@ jobs:
             echo "buildah: <absent>"
           fi
 
-          echo "== containerd standalone =="
-          if command -v containerd >/dev/null 2>&1; then
-            sudo -n nohup containerd >/tmp/containerd.log 2>&1 </dev/null &
-            sleep 5
-            sudo -n ctr version 2>&1 | head -10
-            echo "--- containerd log tail ---"; tail -30 /tmp/containerd.log 2>&1
+          echo "== containerd standalone (real binary, not the shim) =="
+          if [ -x /tmp/dockerbin/containerd ]; then
+            sudo -n env "PATH=/tmp/dockerbin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
+              /tmp/dockerbin/containerd >/tmp/containerd.log 2>&1 </dev/null &
+            sleep 8
+            sudo -n /tmp/dockerbin/ctr version </dev/null 2>&1 | head -10
+            echo "ctr version rc=$?"
+            echo "--- containerd log tail ---"; tail -40 /tmp/containerd.log 2>&1
           else
-            echo "containerd: <absent>"
+            echo "containerd: <unresolved>"
+          fi
+
+          echo "== runc directly: the narrowest possible container start =="
+          if [ -x /tmp/dockerbin/runc ]; then
+            B=/tmp/probe-bundle
+            mkdir -p "$B/rootfs"
+            # A rootfs is not needed for the failure we are measuring: runc
+            # reports what the kernel refuses long before it execs anything.
+            /tmp/dockerbin/runc spec --rootless -b "$B" 2>&1 | tail -5
+            ls -l "$B" 2>&1
+            sudo -n /tmp/dockerbin/runc --root /tmp/runc-root run probe-ctr -b "$B" </dev/null 2>&1 | tail -15
+            echo "runc run rc=$?"
+          else
+            echo "runc: <unresolved>"
           fi
           exit 0
 
