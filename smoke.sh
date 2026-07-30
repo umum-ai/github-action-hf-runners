@@ -48,7 +48,7 @@ work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 
 # --- the advertised commands run at all ------------------------------------
-for tool in gh gcloud mise jq git zstd sqlite3 psql; do
+for tool in gh gcloud mise jq git zstd sqlite3 psql buildah skopeo; do
     if out=$("$tool" --version 2>&1); then
         pass "$tool --version -> $(printf '%s\n' "$out" | head -n 1)"
     else
@@ -97,6 +97,37 @@ fi
 [ "$got" = "answer=42" ] || fail "sqlite3 returned the wrong row" \
                                 "expected 'answer=42', got '$got'"
 pass "sqlite3 creates a table and reads it back ($got)"
+
+# --- buildah really builds an image -----------------------------------------
+# A job on these runners has no docker daemon, so buildah is the only way it
+# reaches an OCI image. What has to hold is that a bare `sudo buildah build`
+# works: the storage driver, the isolation and the two variables that stop
+# buildah re-execing itself into a user namespace it cannot have all come from
+# the image, never from the command line. The build is `FROM scratch` on
+# purpose — it needs no registry, and it is the shape of build the runners can
+# actually serve.
+bwork=/tmp/smoke-buildah
+sudo rm -rf "$bwork"
+mkdir -p "$bwork/ctx"
+echo 'built-by-the-smoke-tests' >"$bwork/ctx/payload.txt"
+printf 'FROM scratch\nCOPY payload.txt /payload.txt\n' >"$bwork/ctx/Dockerfile"
+
+if ! out=$(sudo buildah build -t smoke-image "$bwork/ctx" 2>&1); then
+    fail "'sudo buildah build' could not build a FROM-scratch image" \
+         "$(printf '%s\n' "$out" | tail -n 5)"
+fi
+if ! out=$(sudo buildah push smoke-image "oci-archive:$bwork/smoke.tar" 2>&1); then
+    fail "buildah built an image it could not write out as an OCI archive" \
+         "$(printf '%s\n' "$out" | tail -n 5)"
+fi
+if ! manifest=$(sudo skopeo inspect --raw "oci-archive:$bwork/smoke.tar" 2>&1); then
+    fail "skopeo could not read back the OCI archive buildah wrote" \
+         "$(printf '%s\n' "$manifest" | tail -n 5)"
+fi
+layers=$(printf '%s' "$manifest" | jq -r '.layers | length' 2>/dev/null)
+[ "$layers" = "1" ] || fail "the image buildah built carries $layers layers, expected 1" \
+                            "$(printf '%s\n' "$manifest" | head -n 5)"
+pass "buildah builds an image and skopeo reads it back ($layers layer)"
 
 # --- git carries no core.hooksPath ------------------------------------------
 # The dotfiles baked into the image set one; a core.hooksPath pointing outside

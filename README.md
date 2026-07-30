@@ -9,8 +9,9 @@ The image is built from [`Dockerfile`](Dockerfile) and started by
 [`entrypoint.sh`](entrypoint.sh). Pushes to `main` publish `:latest` and `:<commit sha>`;
 a `v*` tag additionally publishes `:<tag>`. See
 [`.github/workflows/publish.yml`](.github/workflows/publish.yml) — it runs on
-`ubuntu-latest` rather than on our own runners, because building an image needs a
-docker daemon and these runners do not have one.
+`ubuntu-latest` rather than on our own runners, because this
+[`Dockerfile`](Dockerfile) has `RUN` steps and a runner cannot execute one (see
+[Building images](#building-images)).
 
 ## Using it
 
@@ -50,7 +51,9 @@ and `actions/upload-artifact`, which fall back to a much slower gzip path withou
 `file`, `pkg-config`, `gawk`, `gettext-base`, `sqlite3`, `postgresql-client`, and the usual
 network debugging handful (`ip`, `ping`, `dig`, `lsof`, `nc`). It also carries the shared
 libraries Chromium links against, so `pnpm exec playwright install chromium` works without
-`--with-deps` and without an apt round-trip on every run.
+`--with-deps` and without an apt round-trip on every run, and `buildah` and `skopeo`, which
+are how a job reaches an OCI image without a daemon (see
+[Building images](#building-images)).
 
 Language toolchains do not come from the image. The build applies
 [kvokka's dotfiles](https://github.com/kvokka/dotfiles) with chezmoi, which installs
@@ -75,9 +78,10 @@ Nothing reaches GHCR unverified. [`publish.yml`](.github/workflows/publish.yml) 
 image into the runner's own docker daemon, runs [`smoke.sh`](smoke.sh) against it, and
 pushes only if that passes. The script checks that the advertised tool set *works* rather
 than merely being installed: `jq` parses a document, `zstd` survives a round trip, `sqlite3`
-creates a table and reads it back, `envsubst` expands a variable, the Chromium shared
-libraries are in the linker cache, the runner binary reports the version the image
-advertises, and `core.hooksPath` is unset in both the global and the system git config.
+creates a table and reads it back, `envsubst` expands a variable, a bare `sudo buildah build`
+produces an image that `skopeo` can read back, the Chromium shared libraries are in the
+linker cache, the runner binary reports the version the image advertises, and
+`core.hooksPath` is unset in both the global and the system git config.
 Every check runs in a non-login, non-interactive shell — the shell a workflow step gets —
 so a tool that only resolves out of shell initialization fails here exactly as it would in
 a job.
@@ -95,14 +99,61 @@ Change `ARG RUNNER_VERSION` in the [`Dockerfile`](Dockerfile) to a release tag f
 push to `main`. The runner is started with `--disableupdate`, so the pin is what actually
 runs; nothing self-updates mid-job.
 
+## Building images
+
+There is no docker daemon on these runners, and there is no way to start one: a job runs
+already inside somebody else's user namespace, without `CAP_SYS_ADMIN`, and the kernel
+refuses both `unshare(CLONE_NEWUSER)` and `unshare(CLONE_NEWNS)`. `mount(2)` is refused in
+every form, including a plain bind mount, and `/sys/fs/cgroup` is read only. Images are
+therefore built with [buildah](https://buildah.io), which keeps its whole graph in ordinary
+directories under the `vfs` driver and never mounts anything:
+
+```yaml
+jobs:
+  image:
+    runs-on: hf-jobs-cpu-upgrade
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo buildah build -t ghcr.io/umum-ai/thing:${{ github.sha }} .
+      - run: |
+          sudo buildah login -u "${{ github.actor }}" -p "${{ secrets.GITHUB_TOKEN }}" ghcr.io
+          sudo buildah push ghcr.io/umum-ai/thing:${{ github.sha }}
+```
+
+`sudo` is not decoration: buildah has to be euid 0 to write a store whose files carry
+foreign ownership. It needs no flags — the storage driver, the isolation and the two
+variables that keep buildah from re-execing itself into a user namespace it cannot have all
+come from the image. [`skopeo`](https://github.com/containers/skopeo) is there too, for
+copying a finished image between a registry, the local store and a tarball.
+
+**A Dockerfile built here may not execute anything.** `RUN` fails —
+`creating new mount namespace ...: operation not permitted` — and so does anything else that
+starts a process inside the image being built. `FROM`, `COPY`, `ADD`, `ENV`, `WORKDIR`,
+`ENTRYPOINT` and the rest of the metadata instructions all work, base images are pulled and
+unpacked normally, and a `FROM scratch` build needs no registry at all. So the compiling,
+the `pnpm install`, the `pip install` happen in workflow steps, on the runner, and the
+Dockerfile only copies the result in. Building the runner image itself is the counterexample
+— [`Dockerfile`](Dockerfile) is full of `RUN` — which is why
+[`publish.yml`](.github/workflows/publish.yml) stays on `ubuntu-latest`.
+
+BuildKit is not in the image. Its first act on any build, before it has even read the
+Dockerfile, is to mount its own snapshot read only, and that mount is refused here; every
+worker shape it offers — rootful, rootless, `--oci-worker-no-process-sandbox`, the `native`
+snapshotter, `buildctl-daemonless.sh` — fails at the same call.
+[`.github/workflows/probe-image-build.yml`](.github/workflows/probe-image-build.yml) is the
+measurement; it walks BuildKit, buildah and runc itself across every worker shape and
+reports one `RESULT` line each. It runs on demand, and on a pull request that changes it.
+
 ## Known limitations
 
 The image does have a docker client — it arrives transitively with the dotfiles' global mise
 tool set rather than from the [`Dockerfile`](Dockerfile) — but a Hugging Face Job has no
 docker daemon for it to talk to. Jobs that use `services:`, `docker/setup-buildx-action`,
-`docker build`/`run`/`push`, or `docker compose` therefore fail on `hf-jobs-cpu-upgrade`
-partway through, with `Cannot connect to the Docker daemon at unix:///var/run/docker.sock`
-rather than a missing command, and should stay on `ubuntu-latest`.
+`docker build`/`run`/`push`, or `docker compose` fail on `hf-jobs-cpu-upgrade` partway
+through, with `Cannot connect to the Docker daemon at unix:///var/run/docker.sock` rather
+than a missing command. Building and pushing an image has an answer here (see
+[Building images](#building-images)); running one does not, so a job that needs a container
+to actually execute belongs on `ubuntu-latest`.
 
 There is also no `/opt/hostedtoolcache`, so `actions/setup-node`, `actions/setup-python`
 and the rest of the `actions/setup-*` family download their toolchain on every run instead

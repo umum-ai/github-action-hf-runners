@@ -55,6 +55,35 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     zstd \
     && rm -rf /var/lib/apt/lists/*
 
+# Building and moving OCI images without a daemon. Buildah keeps its whole
+# graph in plain directories under the `vfs` driver, so nothing in a build needs
+# mount(2) — which is what makes it the one builder that works on a runner
+# holding no CAP_SYS_ADMIN. Skopeo copies finished images between a registry,
+# the local store and a tarball, again with no daemon in the middle.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    buildah \
+    skopeo \
+    && rm -rf /var/lib/apt/lists/*
+
+# Buildah looks at its own capabilities on startup and, finding no
+# CAP_SYS_ADMIN, re-execs itself into a fresh user namespace to get one. That
+# namespace is refused here, and buildah exits on
+# `unshare(CLONE_NEWUSER): Operation not permitted` before it reads a
+# Dockerfile. It skips the re-exec when it is euid 0 and already holds the
+# mapped root of somebody else's namespace, which is what these two variables
+# assert; _CONTAINERS_ROOTLESS_UID only has to be non-zero. Together with the
+# `vfs` driver and chroot isolation they are the whole configuration a build
+# needs, so `sudo buildah build -t <ref> .` works with no flags of its own.
+ENV BUILDAH_ISOLATION=chroot \
+    STORAGE_DRIVER=vfs \
+    _CONTAINERS_ROOTLESS_UID=1001 \
+    _CONTAINERS_USERNS_CONFIGURED=done
+
+RUN printf '[storage]\ndriver = "vfs"\n' >/etc/containers/storage.conf \
+    && printf 'Defaults env_keep += "BUILDAH_ISOLATION STORAGE_DRIVER REGISTRY_AUTH_FILE _CONTAINERS_ROOTLESS_UID _CONTAINERS_USERNS_CONFIGURED"\n' \
+       >/etc/sudoers.d/buildah \
+    && chmod 0440 /etc/sudoers.d/buildah
+
 # Shared libraries Chromium links against, so `playwright install chromium`
 # needs neither `--with-deps` nor an apt round-trip on every run.
 RUN apt-get update && apt-get install -y --no-install-recommends \

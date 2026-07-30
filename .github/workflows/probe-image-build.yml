@@ -9,8 +9,12 @@ name: probe-image-build
 # Grep the log for `RESULT ` to read the matrix.
 
 on:
-  pull_request:
   workflow_dispatch:
+  # A measurement, not a gate: it spends a runner and asserts nothing, so it
+  # runs when asked and when the measurement itself changes.
+  pull_request:
+    paths:
+      - .github/workflows/probe-image-build.yml
 
 permissions:
   contents: read
