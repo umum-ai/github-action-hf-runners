@@ -1,0 +1,8 @@
+ignored:
+  # The image runs as the unprivileged `runner` user with passwordless sudo,
+  # which is exactly how the GitHub Actions runner expects to be able to
+  # install job dependencies at runtime.
+  - DL3004
+  # Pinning apt versions here would break the build every time Ubuntu ships a
+  # security update; the base image tag is the pin that matters.
+  - DL3008
