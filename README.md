@@ -69,6 +69,25 @@ The dotfiles also set a global `core.hooksPath`, which makes `prek install` refu
 The image clears that setting, and `entrypoint.sh` clears it again before starting the
 runner.
 
+## Smoke tests
+
+Nothing reaches GHCR unverified. [`publish.yml`](.github/workflows/publish.yml) builds the
+image into the runner's own docker daemon, runs [`smoke.sh`](smoke.sh) against it, and
+pushes only if that passes. The script checks that the advertised tool set *works* rather
+than merely being installed: `jq` parses a document, `zstd` survives a round trip, `sqlite3`
+creates a table and reads it back, `envsubst` expands a variable, the Chromium shared
+libraries are in the linker cache, the runner binary reports the version the image
+advertises, and `core.hooksPath` is unset in both the global and the system git config.
+Every check runs in a non-login, non-interactive shell — the shell a workflow step gets —
+so a tool that only resolves out of shell initialization fails here exactly as it would in
+a job.
+
+The script takes an image reference and can be pointed at anything, including what is live:
+
+```bash
+./smoke.sh ghcr.io/umum-ai/jobs-actions-runner:latest
+```
+
 ## Bumping the runner version
 
 Change `ARG RUNNER_VERSION` in the [`Dockerfile`](Dockerfile) to a release tag from

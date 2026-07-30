@@ -20,16 +20,14 @@ jobs:
     # HF Jobs runner this repository produces does not have one.
     runs-on: ubuntu-latest
     timeout-minutes: 60
+    env:
+      # `main` and `v*` tags are the refs that reach GHCR. Every other ref still
+      # builds the image and runs the smoke tests, it just keeps the result.
+      PUBLISH: ${{ github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v') }}
     steps:
       - uses: actions/checkout@v4
 
       - uses: docker/setup-buildx-action@v3
-
-      - uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Compute tags
         id: meta
@@ -40,12 +38,36 @@ jobs:
             tags="${tags},${image}:${GITHUB_REF#refs/tags/}"
           fi
           echo "tags=${tags}" >> "$GITHUB_OUTPUT"
+          echo "smoke_ref=${image}:${{ github.sha }}" >> "$GITHUB_OUTPUT"
 
-      - uses: docker/build-push-action@v6
+      # Into the runner's docker daemon, not to the registry: the image has to
+      # pass the smoke tests below before anything is published.
+      - name: Build image
+        uses: docker/build-push-action@v6
         with:
           context: .
           file: Dockerfile
           platforms: linux/amd64
-          push: true
+          load: true
+          push: false
           provenance: false
           tags: ${{ steps.meta.outputs.tags }}
+
+      - name: Smoke-test image
+        run: ./smoke.sh "${{ steps.meta.outputs.smoke_ref }}"
+
+      - uses: docker/login-action@v3
+        if: env.PUBLISH == 'true'
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Pushes the very bytes the smoke tests ran against.
+      - name: Push image
+        if: env.PUBLISH == 'true'
+        run: |
+          IFS=',' read -ra refs <<< "${{ steps.meta.outputs.tags }}"
+          for ref in "${refs[@]}"; do
+            docker push "${ref}"
+          done
