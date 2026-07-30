@@ -48,12 +48,34 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     lsof \
     netcat-openbsd \
     pkg-config \
-    postgresql-client \
     sqlite3 \
     tzdata \
     vim-tiny \
     zstd \
     && rm -rf /var/lib/apt/lists/*
+
+# PostgreSQL 17 from PGDG, since Ubuntu 24.04 carries only the 16 branch. A job
+# on these runners has no docker daemon behind `services:`, so it runs the
+# database as a job process; server and client come from the same branch so that
+# `psql` and `pg_dump` are never older than the cluster they are pointed at.
+#
+# `create_main_cluster = false` is what leaves the image cluster-free: the
+# postinst would otherwise put a cluster in /var/lib/postgresql/17 that nothing
+# here can start, and a job creates the cluster it needs with `initdb` anyway.
+RUN curl -fsSL -o /usr/share/keyrings/postgresql-pgdg.asc https://www.postgresql.org/media/keys/ACCC4CF8.asc \
+    && echo "deb [signed-by=/usr/share/keyrings/postgresql-pgdg.asc] https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" \
+       > /etc/apt/sources.list.d/pgdg.list \
+    && apt-get update && apt-get install -y --no-install-recommends postgresql-common \
+    && sed -i 's/^#*create_main_cluster.*/create_main_cluster = false/' /etc/postgresql-common/createcluster.conf \
+    && apt-get install -y --no-install-recommends \
+    postgresql-17 \
+    postgresql-client-17 \
+    && rm -rf /var/lib/apt/lists/*
+
+# The server binaries sit outside every default PATH, and a workflow step is a
+# plain `bash -e` that sources no shell initialization, so `initdb`, `pg_ctl` and
+# friends have to resolve from the image environment itself.
+ENV PATH=/usr/lib/postgresql/17/bin:${PATH}
 
 # Shared libraries Chromium links against, so `playwright install chromium`
 # needs neither `--with-deps` nor an apt round-trip on every run.

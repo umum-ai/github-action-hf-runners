@@ -6,7 +6,8 @@
 #
 # The checks prove that the tool set the image advertises actually works, not
 # that files are present: jq parses, zstd round-trips, sqlite3 stores and reads
-# back, envsubst substitutes. They run inside a non-login, non-interactive
+# back, envsubst substitutes, a PostgreSQL cluster comes up and answers a query
+# before it is stopped again. They run inside a non-login, non-interactive
 # shell, which is the shell a GitHub Actions step gets, so a tool that only
 # resolves from shell initialization counts as broken here too.
 #
@@ -145,6 +146,79 @@ pass "the runner binary runs and reports $runner_version"
 [ -f /entrypoint.sh ] || fail "/entrypoint.sh is missing"
 [ -x /entrypoint.sh ] || fail "/entrypoint.sh is not executable"
 pass "/entrypoint.sh is present and executable"
+
+# --- PostgreSQL initializes, starts, serves and stops -----------------------
+# A job runs its database as a job process, so the whole cycle has to work for an
+# unprivileged user; the binaries being installed proves nothing on its own.
+for tool in postgres initdb pg_ctl pg_isready createdb psql; do
+    path=$(command -v "$tool" 2>/dev/null) \
+        || fail "$tool does not resolve on PATH" \
+                "a job cannot be expected to spell out /usr/lib/postgresql/17/bin"
+    pass "$tool -> $path"
+done
+
+server_version=$(postgres --version 2>&1) || fail "\`postgres --version\` did not run" "$server_version"
+case "$server_version" in
+    *"(PostgreSQL) 17."*) pass "$server_version" ;;
+    *) fail "the server is not on the 17 branch" "postgres --version -> $server_version" ;;
+esac
+
+client_version=$(psql --version 2>&1) || fail "\`psql --version\` did not run" "$client_version"
+case "$client_version" in
+    *"(PostgreSQL) 17."*) pass "$client_version" ;;
+    *) fail "the client is not on the same branch as the server" \
+            "server: $server_version, client: $client_version" ;;
+esac
+
+# No cluster of the image's own: nothing here can start one, and a leftover would
+# shadow the data directory a job builds.
+clusters=$(pg_lsclusters --no-header 2>/dev/null || true)
+[ -z "$clusters" ] || fail "the image ships a cluster of its own" "$clusters"
+pass "the image ships no cluster"
+
+[ "$(id -u)" -ne 0 ] || fail "the checks are running as root" \
+    "initdb refuses to run as root, and a workflow step is not root either"
+
+pgdata="$work/pgdata"
+socket="$work/socket"
+mkdir -p "$socket"
+
+if ! out=$(initdb -D "$pgdata" --auth=trust --encoding=UTF8 --no-sync 2>&1); then
+    fail "initdb could not create a cluster in $pgdata" "$(printf '%s\n' "$out" | tail -n 5)"
+fi
+pass "initdb created a cluster as $(id -un)"
+
+# A unix socket inside the temp directory, not a TCP port: two of these running at
+# once must not be able to collide.
+if ! out=$(pg_ctl -D "$pgdata" -l "$work/pg.log" -o "-k $socket -h ''" start 2>&1); then
+    fail "pg_ctl could not start the cluster" \
+         "$(printf '%s\n' "$out"; tail -n 20 "$work/pg.log" 2>/dev/null)"
+fi
+
+deadline=$((SECONDS + 30))
+until pg_isready -h "$socket" -q; do
+    [ "$SECONDS" -lt "$deadline" ] \
+        || fail "the cluster did not accept connections within 30s" \
+                "$(tail -n 20 "$work/pg.log" 2>/dev/null)"
+    sleep 1
+done
+pass "pg_ctl started the cluster and pg_isready reports it accepting connections"
+
+if ! out=$(createdb -h "$socket" smoke 2>&1); then
+    fail "createdb could not create a database" "$out"
+fi
+
+if ! got=$(psql -h "$socket" -d smoke -Atc 'SELECT 1' 2>&1); then
+    fail "psql could not query the database createdb just made" "$got"
+fi
+[ "$got" = "1" ] || fail "psql returned the wrong value for SELECT 1" \
+                        "expected '1', got '$got'"
+pass "createdb, then psql -c 'SELECT 1' -> $got"
+
+if ! out=$(pg_ctl -D "$pgdata" -m fast stop 2>&1); then
+    fail "pg_ctl could not stop the cluster" "$out"
+fi
+pass "pg_ctl stopped the cluster"
 
 printf '\nsmoke: all checks passed\n'
 CHECKS
