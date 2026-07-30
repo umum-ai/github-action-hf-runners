@@ -1,0 +1,502 @@
+name: probe-image-build
+
+# Measures which OCI image builder can actually produce an image on the HF Jobs
+# runner, which has no docker daemon, no CAP_SYS_ADMIN, no nested namespaces and
+# a read-only cgroupfs. Candidates are installed inside the job, not baked into
+# the image, so this file changes nothing for consuming workflows. Every step is
+# allowed to fail so one run produces the whole matrix.
+#
+# Grep the log for `RESULT ` to read the matrix.
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  BUILDKIT_VERSION: v0.32.0
+  CRANE_VERSION: v0.21.7
+  BASE_IMAGE: alpine:3.21
+
+jobs:
+  probe:
+    runs-on: hf-jobs-cpu-upgrade
+    timeout-minutes: 30
+
+    steps:
+      - name: Environment and egress
+        continue-on-error: true
+        run: |
+          set +e
+          echo "== id / caps =="
+          id
+          grep -E '^(Cap|Seccomp|NoNewPrivs)' /proc/self/status
+          echo "== already in a userns? =="
+          cat /proc/self/uid_map
+          echo "== apt reachable? =="
+          sudo -n apt-get update -qq </dev/null 2>&1 | tail -5
+          echo "apt-get update rc=$?"
+          echo "== github/registry reachable? =="
+          curl -fsS -o /dev/null -w 'github.com %{http_code}\n' https://github.com 2>&1
+          curl -sS -o /dev/null -w 'registry-1.docker.io %{http_code}\n' https://registry-1.docker.io/v2/ 2>&1
+          curl -sS -o /dev/null -w 'ghcr.io %{http_code}\n' https://ghcr.io/v2/ 2>&1
+          exit 0
+
+      - name: Install candidates
+        continue-on-error: true
+        run: |
+          set +e
+          mkdir -p /tmp/probe
+
+          echo "== buildkit ${BUILDKIT_VERSION} (static release tarball) =="
+          curl -fsSL -o /tmp/buildkit.tar.gz \
+            "https://github.com/moby/buildkit/releases/download/${BUILDKIT_VERSION}/buildkit-${BUILDKIT_VERSION}.linux-amd64.tar.gz"
+          echo "download rc=$?"
+          sudo -n tar -xzf /tmp/buildkit.tar.gz -C /usr/local --strip-components=1 </dev/null
+          echo "extract rc=$?"
+          ls -l /usr/local/bin/ 2>&1 | grep -E 'buildkit|buildctl'
+          /usr/local/bin/buildkitd --version 2>&1
+          /usr/local/bin/buildctl --version 2>&1
+          /usr/local/bin/buildkit-runc --version 2>&1 | head -3
+
+          echo "== buildah + skopeo from the Ubuntu 24.04 archive =="
+          sudo -n apt-get update -qq </dev/null 2>&1 | tail -3
+          sudo -n apt-get install -y -qq buildah skopeo </dev/null 2>&1 | tail -10
+          echo "apt-get install rc=$?"
+          buildah --version 2>&1
+          skopeo --version 2>&1
+          ls -l /etc/containers/policy.json 2>&1
+
+          echo "== crane ${CRANE_VERSION} =="
+          curl -fsSL "https://github.com/google/go-containerregistry/releases/download/${CRANE_VERSION}/go-containerregistry_Linux_x86_64.tar.gz" \
+            | sudo -n tar -xz -C /usr/local/bin crane 2>&1
+          echo "crane install rc=$?"
+          crane version 2>&1
+
+          echo "== what is on PATH now =="
+          for b in buildkitd buildctl buildkit-runc buildah skopeo crane runc; do
+            echo "${b}: $(command -v "$b" 2>/dev/null || echo '<absent>')"
+          done
+          exit 0
+
+      - name: Fixtures and helper
+        continue-on-error: true
+        run: |
+          set +e
+          mkdir -p /tmp/probe /tmp/ctx
+          echo "payload-from-the-build-context" >/tmp/ctx/payload.txt
+
+          # No base image, no process ever executed in a container: buildkit
+          # serves this from its fileop solver and buildah from its storage layer.
+          cat >/tmp/ctx/Dockerfile.scratch <<'FIXTURE'
+          FROM scratch
+          COPY payload.txt /payload.txt
+          FIXTURE
+
+          # A real base image is pulled and unpacked, but still nothing executes.
+          cat >/tmp/ctx/Dockerfile.copy <<'FIXTURE'
+          FROM alpine:3.21
+          COPY payload.txt /payload.txt
+          FIXTURE
+
+          # The case that needs a container runtime.
+          cat >/tmp/ctx/Dockerfile.run <<'FIXTURE'
+          FROM alpine:3.21
+          RUN echo built-by-a-run-step >/hello
+          FIXTURE
+
+          cat >/tmp/probe/lib.sh <<'HELPER'
+          # run_buildctl <label> <addr> <sudo-prefix>
+          run_buildctl() {
+              label="$1"; addr="$2"; pfx="$3"
+              for case in scratch copy run; do
+                  out="/tmp/out-${label}-${case}.tar"
+                  log="/tmp/log-${label}-${case}.txt"
+                  t0=$(date +%s)
+                  $pfx env "DOCKER_CONFIG=/tmp/probe/dockercfg" /usr/local/bin/buildctl \
+                      --addr "$addr" build \
+                      --frontend dockerfile.v0 \
+                      --local context=/tmp/ctx \
+                      --local dockerfile=/tmp/ctx \
+                      --opt filename="Dockerfile.${case}" \
+                      --output "type=oci,dest=${out},name=probe/${case}:latest" \
+                      --progress plain >"$log" 2>&1 </dev/null
+                  rc=$?
+                  t1=$(date +%s)
+                  size=0; [ -f "$out" ] && size=$(wc -c <"$out")
+                  echo "RESULT buildkit ${label} ${case} rc=${rc} secs=$((t1-t0)) bytes=${size}"
+                  if [ "$rc" -ne 0 ]; then
+                      echo "--- buildctl ${label} ${case} tail ---"
+                      tail -n 30 "$log"
+                  fi
+              done
+          }
+
+          # run_buildah <label> <sudo-prefix> <extra buildah bud args...>
+          run_buildah() {
+              label="$1"; shift
+              pfx="$1"; shift
+              root="/tmp/bh-${label}"
+              $pfx rm -rf "$root" 2>/dev/null
+              $pfx mkdir -p "${root}/root" "${root}/run" 2>/dev/null
+              for case in scratch copy run; do
+                  log="/tmp/log-buildah-${label}-${case}.txt"
+                  out="/tmp/out-buildah-${label}-${case}.tar"
+                  t0=$(date +%s)
+                  $pfx buildah --storage-driver vfs --root "${root}/root" --runroot "${root}/run" \
+                      bud "$@" -f "/tmp/ctx/Dockerfile.${case}" \
+                      -t "probe-${label}-${case}" /tmp/ctx >"$log" 2>&1 </dev/null
+                  rc=$?
+                  if [ "$rc" -eq 0 ]; then
+                      $pfx buildah --storage-driver vfs --root "${root}/root" --runroot "${root}/run" \
+                          push "probe-${label}-${case}" "oci-archive:${out}" >>"$log" 2>&1 </dev/null
+                      rc=$?
+                  fi
+                  t1=$(date +%s)
+                  size=0; [ -f "$out" ] && size=$(wc -c <"$out")
+                  echo "RESULT buildah ${label} ${case} rc=${rc} secs=$((t1-t0)) bytes=${size}"
+                  if [ "$rc" -ne 0 ]; then
+                      echo "--- buildah ${label} ${case} tail ---"
+                      tail -n 25 "$log"
+                  fi
+              done
+          }
+
+          # wait_for_buildkitd <addr> <sudo-prefix> <logfile>
+          wait_for_buildkitd() {
+              addr="$1"; pfx="$2"; log="$3"
+              for i in $(seq 1 30); do
+                  if $pfx /usr/local/bin/buildctl --addr "$addr" debug workers >/tmp/workers.txt 2>&1 </dev/null; then
+                      echo "buildkitd answered after ${i}s"
+                      cat /tmp/workers.txt
+                      return 0
+                  fi
+                  sleep 1
+              done
+              echo "buildkitd never answered on ${addr}"
+              echo "--- last buildctl error ---"; cat /tmp/workers.txt 2>&1
+              echo "--- buildkitd log tail ---"; tail -n 40 "$log" 2>&1
+              return 1
+          }
+          HELPER
+
+          # GHCR credentials for the push probe, written by hand: `docker login`
+          # talks to a daemon and there is none here.
+          mkdir -p /tmp/probe/dockercfg
+          auth=$(printf '%s:%s' "${{ github.actor }}" "${{ secrets.GITHUB_TOKEN }}" | base64 -w0)
+          printf '{"auths":{"ghcr.io":{"auth":"%s"}}}' "$auth" >/tmp/probe/dockercfg/config.json
+          chmod 0644 /tmp/probe/dockercfg/config.json
+          echo "wrote /tmp/probe/dockercfg/config.json ($(wc -c </tmp/probe/dockercfg/config.json) bytes)"
+
+          ls -l /tmp/ctx /tmp/probe
+          exit 0
+
+      - name: runc — can any process start in a container at all?
+        continue-on-error: true
+        run: |
+          set +e
+          RUNC=/usr/local/bin/buildkit-runc
+          B=/tmp/runc-bundle
+          sudo -n rm -rf "$B" </dev/null; mkdir -p "$B/rootfs"
+
+          echo "== unpack ${BASE_IMAGE} as a rootfs (no daemon, via crane) =="
+          crane export "${BASE_IMAGE}" - 2>/tmp/crane-export.err | sudo -n tar -x -C "$B/rootfs" 2>&1 | tail -5
+          head -3 /tmp/crane-export.err 2>&1
+          sudo -n ls "$B/rootfs" </dev/null 2>&1 | head -3
+
+          cd "$B" || exit 0
+          sudo -n "$RUNC" spec </dev/null 2>&1
+          echo "runc spec rc=$?"
+          sudo -n cp "$B/config.json" /tmp/config-base.json </dev/null
+          sudo -n chmod 0644 /tmp/config-base.json </dev/null
+
+          try_spec() {
+              name="$1"; filter="$2"
+              jq "$filter" /tmp/config-base.json >"/tmp/config-${name}.json" 2>"/tmp/jq-${name}.err"
+              if [ ! -s "/tmp/config-${name}.json" ]; then
+                  echo "RESULT runc ${name} rc=jq-failed"; cat "/tmp/jq-${name}.err"; return
+              fi
+              sudo -n cp "/tmp/config-${name}.json" "$B/config.json" </dev/null
+              sudo -n "$RUNC" --root "/tmp/runc-root-${name}" run "probe-${name}" -b "$B" \
+                  </dev/null >"/tmp/runc-${name}.txt" 2>&1
+              rc=$?
+              echo "RESULT runc ${name} rc=${rc}"
+              head -n 8 "/tmp/runc-${name}.txt"
+              sudo -n "$RUNC" --root "/tmp/runc-root-${name}" delete -f "probe-${name}" 2>/dev/null
+          }
+
+          COMMON='.process.terminal=false
+                  | .process.args=["/bin/echo","hello-from-the-container"]
+                  | .root.readonly=false'
+
+          # Baseline: the spec runc itself generates, minus the tty it cannot open.
+          try_spec default "${COMMON}"
+
+          # No namespaces at all — the only shape this kernel could accept: a
+          # plain chroot, which is exactly what cap_sys_chroot allows.
+          try_spec nons "${COMMON}
+            | .linux.namespaces=[] | del(.linux.maskedPaths) | del(.linux.readonlyPaths)
+            | .mounts=[]"
+
+          # Same, and no cgroup either: cgroupfs here is mounted read-only.
+          try_spec nons-nocgroup "${COMMON}
+            | .linux.namespaces=[] | del(.linux.maskedPaths) | del(.linux.readonlyPaths)
+            | .mounts=[] | .linux.cgroupsPath=\"\" | del(.linux.resources)"
+
+          # A mount namespace only, to tell "cannot unshare" from "cannot mount".
+          try_spec mountns "${COMMON} | .linux.namespaces=[{\"type\":\"mount\"}]"
+          exit 0
+
+      - name: BuildKit A — rootful, native snapshotter, host network
+        continue-on-error: true
+        run: |
+          set +e
+          . /tmp/probe/lib.sh
+          LOG=/tmp/bk-a.log
+          ADDR=unix:///tmp/bk-a/buildkitd.sock
+          sudo -n mkdir -p /tmp/bk-a /tmp/bk-a-root </dev/null
+
+          sudo -n /usr/local/bin/buildkitd \
+            --root /tmp/bk-a-root \
+            --addr "$ADDR" \
+            --oci-worker=true --containerd-worker=false \
+            --oci-worker-snapshotter=native \
+            --oci-worker-net=host \
+            --debug >"$LOG" 2>&1 </dev/null &
+
+          if wait_for_buildkitd "$ADDR" "sudo -n" "$LOG"; then
+            run_buildctl a "$ADDR" "sudo -n"
+          else
+            echo "RESULT buildkit a all rc=daemon-did-not-start"
+          fi
+          echo "--- buildkitd A log tail ---"; sudo -n tail -n 60 "$LOG" 2>&1
+          sudo -n pkill -f 'buildkitd --root /tmp/bk-a-root' 2>/dev/null
+          exit 0
+
+      - name: BuildKit B — rootless + no-process-sandbox, native snapshotter
+        continue-on-error: true
+        run: |
+          set +e
+          . /tmp/probe/lib.sh
+          LOG=/tmp/bk-b.log
+          ADDR=unix:///tmp/bk-b/buildkitd.sock
+          mkdir -p /tmp/bk-b /tmp/bk-b-root
+          export XDG_RUNTIME_DIR=/tmp/bk-b-xdg
+          mkdir -p "$XDG_RUNTIME_DIR"
+
+          # The documented shape for a buildkitd that is already inside somebody
+          # else's user namespace and may not create another one.
+          /usr/local/bin/buildkitd \
+            --root /tmp/bk-b-root \
+            --addr "$ADDR" \
+            --oci-worker=true --containerd-worker=false \
+            --oci-worker-rootless \
+            --oci-worker-no-process-sandbox \
+            --oci-worker-snapshotter=native \
+            --oci-worker-net=host \
+            --debug >"$LOG" 2>&1 </dev/null &
+
+          if wait_for_buildkitd "$ADDR" "" "$LOG"; then
+            run_buildctl b "$ADDR" ""
+          else
+            echo "RESULT buildkit b all rc=daemon-did-not-start"
+          fi
+          echo "--- buildkitd B log tail ---"; tail -n 60 "$LOG" 2>&1
+          pkill -f 'buildkitd --root /tmp/bk-b-root' 2>/dev/null
+          exit 0
+
+      - name: BuildKit C — root uid, no-process-sandbox, via config file
+        continue-on-error: true
+        run: |
+          set +e
+          . /tmp/probe/lib.sh
+          LOG=/tmp/bk-c.log
+          ADDR=unix:///tmp/bk-c/buildkitd.sock
+          sudo -n mkdir -p /tmp/bk-c /tmp/bk-c-root </dev/null
+
+          # The two flags may refuse to be combined on the command line; the
+          # config file is the other way to ask for the same worker shape.
+          cat >/tmp/bk-c.toml <<'TOML'
+          root = "/tmp/bk-c-root"
+
+          [worker.oci]
+          enabled = true
+          snapshotter = "native"
+          noProcessSandbox = true
+          rootless = false
+
+          [worker.containerd]
+          enabled = false
+          TOML
+          cat /tmp/bk-c.toml
+
+          sudo -n /usr/local/bin/buildkitd \
+            --config /tmp/bk-c.toml \
+            --addr "$ADDR" \
+            --oci-worker-net=host \
+            --debug >"$LOG" 2>&1 </dev/null &
+
+          if wait_for_buildkitd "$ADDR" "sudo -n" "$LOG"; then
+            run_buildctl c "$ADDR" "sudo -n"
+          else
+            echo "RESULT buildkit c all rc=daemon-did-not-start"
+          fi
+          echo "--- buildkitd C log tail ---"; sudo -n tail -n 60 "$LOG" 2>&1
+          sudo -n pkill -f 'buildkitd --config /tmp/bk-c.toml' 2>/dev/null
+          exit 0
+
+      - name: BuildKit D — buildctl-daemonless.sh
+        continue-on-error: true
+        run: |
+          set +e
+          echo "== is buildctl-daemonless.sh in the release tarball? =="
+          ls -l /usr/local/bin/buildctl-daemonless.sh 2>&1
+          if [ ! -x /usr/local/bin/buildctl-daemonless.sh ]; then
+            curl -fsSL -o /tmp/buildctl-daemonless.sh \
+              "https://raw.githubusercontent.com/moby/buildkit/${BUILDKIT_VERSION}/examples/buildctl-daemonless/buildctl-daemonless.sh"
+            echo "download rc=$?"
+            sudo -n install -m 0755 /tmp/buildctl-daemonless.sh /usr/local/bin/buildctl-daemonless.sh </dev/null
+          fi
+          t0=$(date +%s)
+          sudo -n env BUILDKITD_FLAGS="--oci-worker-snapshotter=native --oci-worker-net=host" \
+            /usr/local/bin/buildctl-daemonless.sh build \
+            --frontend dockerfile.v0 \
+            --local context=/tmp/ctx --local dockerfile=/tmp/ctx \
+            --opt filename=Dockerfile.scratch \
+            --output type=oci,dest=/tmp/out-daemonless-scratch.tar,name=probe/scratch:latest \
+            --progress plain >/tmp/log-daemonless.txt 2>&1 </dev/null
+          rc=$?; t1=$(date +%s)
+          echo "RESULT buildkit daemonless scratch rc=${rc} secs=$((t1-t0))"
+          tail -n 25 /tmp/log-daemonless.txt
+          exit 0
+
+      - name: Buildah A — bud, root, vfs, chroot isolation
+        continue-on-error: true
+        run: |
+          set +e
+          . /tmp/probe/lib.sh
+          echo "== buildah info (root) =="
+          sudo -n buildah --storage-driver vfs info </dev/null 2>&1 | head -30
+          run_buildah chroot "sudo -n" --isolation chroot
+          exit 0
+
+      - name: Buildah B — bud, root, vfs, oci isolation
+        continue-on-error: true
+        run: |
+          set +e
+          . /tmp/probe/lib.sh
+          run_buildah oci "sudo -n" --isolation oci
+          exit 0
+
+      - name: Buildah C — from/copy/commit without bud
+        continue-on-error: true
+        run: |
+          set +e
+          root=/tmp/bh-manual
+          sudo -n rm -rf "$root" </dev/null
+          sudo -n mkdir -p "$root/root" "$root/run" </dev/null
+          BH="sudo -n buildah --storage-driver vfs --root ${root}/root --runroot ${root}/run"
+
+          for base in scratch "${BASE_IMAGE}"; do
+            label=$(echo "$base" | tr ':/' '--')
+            t0=$(date +%s)
+            ctr=$($BH from --isolation chroot "$base" </dev/null 2>"/tmp/bh-from-${label}.err")
+            rc=$?
+            echo "buildah from ${base} rc=${rc} ctr=${ctr}"
+            if [ "$rc" -ne 0 ]; then
+              echo "RESULT buildah manual ${label} rc=${rc} stage=from"
+              head -n 5 "/tmp/bh-from-${label}.err"
+              continue
+            fi
+            $BH copy "$ctr" /tmp/ctx/payload.txt /payload.txt </dev/null 2>&1 | tail -3
+            rc=$?
+            if [ "$rc" -ne 0 ]; then
+              echo "RESULT buildah manual ${label} rc=${rc} stage=copy"
+              continue
+            fi
+            $BH commit "$ctr" "oci-archive:/tmp/out-bhmanual-${label}.tar" </dev/null 2>&1 | tail -5
+            rc=$?; t1=$(date +%s)
+            size=0; [ -f "/tmp/out-bhmanual-${label}.tar" ] && size=$(wc -c <"/tmp/out-bhmanual-${label}.tar")
+            echo "RESULT buildah manual ${label} rc=${rc} secs=$((t1-t0)) bytes=${size} stage=commit"
+
+            echo "-- and can it execute a command in that container? --"
+            $BH run --isolation chroot "$ctr" -- /bin/echo hello </dev/null 2>&1 | tail -5
+            echo "RESULT buildah manual-run ${label} rc=$?"
+          done
+          exit 0
+
+      - name: Buildah D — unprivileged
+        continue-on-error: true
+        run: |
+          set +e
+          . /tmp/probe/lib.sh
+          echo "== buildah info (unprivileged) =="
+          buildah --storage-driver vfs info 2>&1 | head -20
+          run_buildah rootless "" --isolation chroot
+          exit 0
+
+      - name: Registry — push what was produced, without a daemon
+        continue-on-error: true
+        run: |
+          set +e
+          repo="ghcr.io/${{ github.repository_owner }}/jobs-actions-runner-probe"
+          export DOCKER_CONFIG=/tmp/probe/dockercfg
+          export REGISTRY_AUTH_FILE=/tmp/probe/dockercfg/config.json
+
+          echo "== what did anything manage to produce? =="
+          ls -l /tmp/out-*.tar 2>&1
+
+          echo "== skopeo pulls without a daemon =="
+          t0=$(date +%s)
+          skopeo copy "docker://docker.io/library/${BASE_IMAGE}" oci-archive:/tmp/skopeo-pull.tar 2>&1 | tail -5
+          echo "RESULT skopeo pull rc=$? secs=$(( $(date +%s) - t0 ))"
+
+          echo "== crane pulls without a daemon =="
+          t0=$(date +%s)
+          crane pull "${BASE_IMAGE}" /tmp/crane-pull.tar 2>&1 | tail -5
+          echo "RESULT crane pull rc=$? secs=$(( $(date +%s) - t0 ))"
+
+          echo "== push the first non-empty artifact to GHCR =="
+          for tar in /tmp/out-*.tar; do
+            [ -s "$tar" ] || continue
+            tag="probe-$(basename "$tar" .tar | sed 's/^out-//')"
+            t0=$(date +%s)
+            skopeo copy --dest-authfile "$REGISTRY_AUTH_FILE" \
+              "oci-archive:${tar}" "docker://${repo}:${tag}" 2>&1 | tail -8
+            echo "RESULT skopeo push ${tag} rc=$? secs=$(( $(date +%s) - t0 ))"
+            break
+          done
+          exit 0
+
+      - name: Matrix
+        continue-on-error: true
+        if: always()
+        run: |
+          set +e
+          echo "== the shapes this run tried; every RESULT line is above =="
+          cat <<'LEGEND'
+          runc      default | nons | nons-nocgroup | mountns
+          buildkit  a (rootful/native) | b (rootless/no-process-sandbox)
+                    c (root uid/no-process-sandbox) | daemonless
+          buildah   chroot | oci | manual (from/copy/commit) | rootless
+          cases     scratch (FROM scratch + COPY)
+                    copy    (FROM alpine + COPY)
+                    run     (FROM alpine + RUN)
+          LEGEND
+          echo "== artifacts produced =="
+          ls -l /tmp/out-*.tar 2>&1
+          exit 0
+
+      - name: Teardown
+        continue-on-error: true
+        if: always()
+        run: |
+          set +e
+          sudo -n pkill -9 buildkitd 2>/dev/null
+          pkill -9 buildkitd 2>/dev/null
+          sudo -n pkill -9 containerd 2>/dev/null
+          echo "teardown done"
+          exit 0
