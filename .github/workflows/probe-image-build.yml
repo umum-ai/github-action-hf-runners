@@ -482,6 +482,69 @@ jobs:
           run_buildah rootless "" --isolation chroot
           exit 0
 
+      - name: Buildah E — the shape the image would ship, with no flags at all
+        continue-on-error: true
+        run: |
+          set +e
+          # Everything the earlier steps passed on the command line, moved to
+          # where the image can put it once: a storage config, a sudoers
+          # env_keep, and the environment itself.
+          sudo -n mkdir -p /etc/containers </dev/null
+          sudo -n tee /etc/containers/storage.conf >/dev/null <<'TOML'
+          [storage]
+          driver = "vfs"
+          runroot = "/var/lib/containers/runroot"
+          graphroot = "/var/lib/containers/storage"
+          TOML
+          sudo -n tee /etc/sudoers.d/buildah >/dev/null <<'SUDOERS'
+          Defaults env_keep += "BUILDAH_ISOLATION STORAGE_DRIVER CONTAINERS_STORAGE_CONF _CONTAINERS_ROOTLESS_UID _CONTAINERS_USERNS_CONFIGURED REGISTRY_AUTH_FILE"
+          SUDOERS
+          sudo -n chmod 0440 /etc/sudoers.d/buildah </dev/null
+          export BUILDAH_ISOLATION=chroot STORAGE_DRIVER=vfs \
+                 _CONTAINERS_ROOTLESS_UID=1001 _CONTAINERS_USERNS_CONFIGURED=done \
+                 CONTAINERS_STORAGE_CONF=/etc/containers/storage.conf
+
+          echo "== does sudo carry the environment through? =="
+          sudo -n env </dev/null | grep -E '^(BUILDAH|STORAGE|CONTAINERS|_CONTAINERS)' | sort
+
+          echo "== where does buildah say its store is? =="
+          sudo -n buildah info </dev/null 2>&1 | jq -r '.store | "driver=\(.GraphDriverName) root=\(.GraphRoot) runroot=\(.RunRoot)"' 2>&1
+
+          for case in scratch copy; do
+            t0=$(date +%s)
+            sudo -n buildah build -f "/tmp/ctx/Dockerfile.${case}" -t "probe-e-${case}" /tmp/ctx \
+              </dev/null >"/tmp/log-e-${case}.txt" 2>&1
+            rc=$?; t1=$(date +%s)
+            echo "RESULT buildah noflags ${case} rc=${rc} secs=$((t1-t0))"
+            [ "$rc" -eq 0 ] || tail -n 15 "/tmp/log-e-${case}.txt"
+          done
+
+          echo "== a base image with some actual weight, for timing =="
+          cat >/tmp/ctx/Dockerfile.node <<'FIXTURE'
+          FROM node:22-alpine
+          COPY payload.txt /srv/payload.txt
+          FIXTURE
+          t0=$(date +%s)
+          sudo -n buildah build -f /tmp/ctx/Dockerfile.node -t probe-e-node /tmp/ctx \
+            </dev/null >/tmp/log-e-node.txt 2>&1
+          rc=$?; t1=$(date +%s)
+          echo "RESULT buildah noflags node22 rc=${rc} secs=$((t1-t0))"
+          [ "$rc" -eq 0 ] || tail -n 15 /tmp/log-e-node.txt
+
+          echo "== and push straight from the store, no skopeo in between =="
+          repo="ghcr.io/${{ github.repository_owner }}/jobs-actions-runner-probe"
+          export REGISTRY_AUTH_FILE=/tmp/probe/dockercfg/config.json
+          t0=$(date +%s)
+          sudo -n buildah push probe-e-node "docker://${repo}:probe-buildah-node" \
+            </dev/null >/tmp/log-e-push.txt 2>&1
+          rc=$?
+          echo "RESULT buildah push node22 rc=${rc} secs=$(( $(date +%s) - t0 ))"
+          tail -n 6 /tmp/log-e-push.txt
+
+          echo "== what the produced image actually contains =="
+          sudo -n buildah inspect --type image probe-e-copy </dev/null 2>&1 | jq -r '.OCIv1.rootfs.diff_ids | length' 2>&1
+          exit 0
+
       - name: Registry — push what was produced, without a daemon
         continue-on-error: true
         run: |
