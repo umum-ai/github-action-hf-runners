@@ -1,0 +1,334 @@
+name: probe-privileges
+
+# Reads what the HF Jobs runtime actually grants a job: identity, capabilities,
+# namespaces, devices, cgroups and whether a container daemon can be started.
+# Every step is allowed to fail so one run produces the whole picture.
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: hf-jobs-cpu-upgrade
+    timeout-minutes: 15
+
+    steps:
+      - name: Identity and sudo
+        continue-on-error: true
+        run: |
+          set +e
+          echo "== id =="
+          id
+          echo "== whoami =="
+          whoami
+          echo "== HOME/PWD =="
+          echo "HOME=$HOME PWD=$PWD"
+          echo "== sudo -n id (non-interactive) =="
+          sudo -n id </dev/null 2>&1
+          echo "sudo -n id rc=$?"
+          echo "== sudo id =="
+          sudo id </dev/null 2>&1
+          echo "sudo id rc=$?"
+          echo "== sudo -l =="
+          sudo -n -l </dev/null 2>&1
+          echo "sudo -l rc=$?"
+          echo "== setuid bit on /usr/bin/sudo =="
+          ls -l /usr/bin/sudo 2>&1
+          echo "== NoNewPrivs =="
+          grep -i nonewprivs /proc/self/status 2>&1
+          exit 0
+
+      - name: Kernel, resources, distro
+        continue-on-error: true
+        run: |
+          set +e
+          echo "== uname -a =="
+          uname -a
+          echo "== nproc =="
+          nproc
+          echo "== free -h =="
+          free -h
+          echo "== df -h =="
+          df -h
+          echo "== os-release =="
+          cat /etc/os-release 2>&1
+          echo "== /proc/1/comm and /proc/1/cgroup =="
+          cat /proc/1/comm 2>&1
+          cat /proc/1/cgroup 2>&1
+          echo "== container hints =="
+          ls -la /.dockerenv /run/.containerenv 2>&1
+          cat /proc/self/environ 2>/dev/null | tr '\0' '\n' | grep -Ei 'container|kube|hf_|space' 2>&1
+          exit 0
+
+      - name: User namespaces
+        continue-on-error: true
+        run: |
+          set +e
+          echo "== unshare -Ur id =="
+          unshare -Ur id 2>&1
+          echo "unshare -Ur rc=$?"
+          echo "== unshare -Urm id (user+mount) =="
+          unshare -Urm id 2>&1
+          echo "unshare -Urm rc=$?"
+          echo "== unshare --user --map-root-user --net id =="
+          unshare --user --map-root-user --net id 2>&1
+          echo "rc=$?"
+          echo "== /proc/sys/user/max_user_namespaces =="
+          cat /proc/sys/user/max_user_namespaces 2>&1
+          echo "== /proc/sys/kernel/unprivileged_userns_clone =="
+          cat /proc/sys/kernel/unprivileged_userns_clone 2>&1
+          echo "== /proc/sys/user/max_mnt_namespaces / max_pid_namespaces =="
+          cat /proc/sys/user/max_mnt_namespaces 2>&1
+          cat /proc/sys/user/max_pid_namespaces 2>&1
+          echo "== am I already in a userns? uid_map/gid_map =="
+          cat /proc/self/uid_map 2>&1
+          cat /proc/self/gid_map 2>&1
+          cat /proc/self/setgroups 2>&1
+          echo "== newuidmap / newgidmap (needed by rootless docker) =="
+          command -v newuidmap newgidmap 2>&1
+          ls -l "$(command -v newuidmap 2>/dev/null)" 2>&1
+          echo "== /etc/subuid /etc/subgid =="
+          cat /etc/subuid 2>&1
+          cat /etc/subgid 2>&1
+          echo "== namespace inodes =="
+          ls -l /proc/self/ns/ 2>&1
+          echo "== bubblewrap (in image) =="
+          bwrap --ro-bind / / --unshare-user --uid 0 id 2>&1
+          echo "bwrap rc=$?"
+          exit 0
+
+      - name: Capabilities
+        continue-on-error: true
+        run: |
+          set +e
+          echo "== /proc/self/status caps =="
+          grep -i -E '^(Cap|Seccomp|NoNewPrivs|Umask|Groups)' /proc/self/status 2>&1
+          echo "== capsh --print =="
+          capsh --print 2>&1
+          echo "capsh rc=$?"
+          echo "== capsh --decode of CapEff =="
+          capeff=$(awk '/^CapEff/{print $2}' /proc/self/status)
+          echo "CapEff raw: ${capeff}"
+          capsh --decode="${capeff}" 2>&1
+          echo "== capsh --decode of CapBnd =="
+          capbnd=$(awk '/^CapBnd/{print $2}' /proc/self/status)
+          echo "CapBnd raw: ${capbnd}"
+          capsh --decode="${capbnd}" 2>&1
+          echo "== sudo capabilities (if sudo works) =="
+          sudo -n grep -i -E '^Cap' /proc/self/status </dev/null 2>&1
+          exit 0
+
+      - name: Devices
+        continue-on-error: true
+        run: |
+          set +e
+          echo "== ls -l /dev =="
+          ls -l /dev 2>&1
+          echo "== /dev/fuse =="
+          ls -l /dev/fuse 2>&1; echo "fuse rc=$?"
+          echo "== /dev/kvm =="
+          ls -l /dev/kvm 2>&1; echo "kvm rc=$?"
+          echo "== /dev/net/tun =="
+          ls -l /dev/net/tun 2>&1; echo "tun rc=$?"
+          echo "== can I mknod? =="
+          sudo -n mknod /tmp/probe-node b 7 200 </dev/null 2>&1; echo "mknod rc=$?"
+          mknod /tmp/probe-node-unpriv b 7 201 2>&1; echo "unpriv mknod rc=$?"
+          echo "== fusermount =="
+          command -v fusermount fusermount3 2>&1
+          exit 0
+
+      - name: Cgroups
+        continue-on-error: true
+        run: |
+          set +e
+          echo "== /proc/self/cgroup =="
+          cat /proc/self/cgroup 2>&1
+          echo "== ls /sys/fs/cgroup =="
+          ls /sys/fs/cgroup 2>&1 | head -40
+          echo "== cgroup mounts =="
+          mount 2>&1 | grep -i cgroup
+          echo "== cgroup.controllers =="
+          cat /sys/fs/cgroup/cgroup.controllers 2>&1
+          echo "== cgroup.subtree_control =="
+          cat /sys/fs/cgroup/cgroup.subtree_control 2>&1
+          echo "== write test: mkdir /sys/fs/cgroup/probe =="
+          mkdir /sys/fs/cgroup/probe 2>&1; echo "mkdir rc=$?"
+          sudo -n mkdir /sys/fs/cgroup/probe-sudo </dev/null 2>&1; echo "sudo mkdir rc=$?"
+          rmdir /sys/fs/cgroup/probe 2>/dev/null; sudo -n rmdir /sys/fs/cgroup/probe-sudo 2>/dev/null
+          echo "== is /sys/fs/cgroup rw or ro? =="
+          findmnt -no OPTIONS /sys/fs/cgroup 2>&1
+          echo "== systemd present? =="
+          command -v systemctl 2>&1; systemctl is-system-running 2>&1
+          exit 0
+
+      - name: Docker socket, binaries, mounts, LSM
+        continue-on-error: true
+        run: |
+          set +e
+          echo "== /var/run/docker.sock =="
+          ls -l /var/run/docker.sock 2>&1; echo "rc=$?"
+          ls -l /run/docker.sock 2>&1; echo "rc=$?"
+          echo "== DOCKER_HOST =="
+          echo "DOCKER_HOST=${DOCKER_HOST:-<unset>}"
+          echo "== which docker/dockerd/containerd/runc/podman/buildah/nerdctl =="
+          for b in docker dockerd containerd containerd-shim-runc-v2 runc podman buildah nerdctl skopeo crun dockerd-rootless.sh dockerd-rootless-setuptool.sh rootlesskit slirp4netns fuse-overlayfs; do
+            p=$(command -v "$b" 2>/dev/null)
+            echo "${b}: ${p:-<absent>}"
+          done
+          echo "== versions =="
+          docker --version 2>&1
+          dockerd --version 2>&1
+          containerd --version 2>&1
+          runc --version 2>&1
+          echo "== docker context ls =="
+          docker context ls 2>&1
+          echo "== seccomp / apparmor =="
+          grep -i seccomp /proc/self/status 2>&1
+          cat /proc/self/attr/current 2>&1; echo "attr rc=$?"
+          ls -l /sys/module/apparmor 2>&1
+          cat /sys/kernel/security/lsm 2>&1
+          aa-status 2>&1 | head -5
+          echo "== mount table =="
+          mount 2>&1
+          echo "== overlayfs support =="
+          grep -E 'overlay|fuse' /proc/filesystems 2>&1
+          echo "== can I mount a tmpfs? =="
+          sudo -n mkdir -p /tmp/probe-mnt </dev/null 2>&1
+          sudo -n mount -t tmpfs none /tmp/probe-mnt </dev/null 2>&1; echo "mount tmpfs rc=$?"
+          sudo -n umount /tmp/probe-mnt 2>/dev/null
+          exit 0
+
+      - name: Start dockerd (rootful)
+        continue-on-error: true
+        run: |
+          set +e
+          LOG=/tmp/dockerd-rootful.log
+          : > "$LOG"
+
+          echo "== launching dockerd =="
+          if sudo -n true </dev/null 2>/dev/null; then
+            echo "using: sudo dockerd"
+            sudo -n nohup dockerd --host=unix:///var/run/docker.sock \
+              --storage-driver=vfs --iptables=false --bridge=none \
+              >>"$LOG" 2>&1 </dev/null &
+          else
+            echo "using: dockerd (no sudo available)"
+            nohup dockerd --host=unix:///var/run/docker.sock \
+              --storage-driver=vfs --iptables=false --bridge=none \
+              >>"$LOG" 2>&1 </dev/null &
+          fi
+          DPID=$!
+          echo "launcher pid=$DPID"
+
+          echo "== waiting up to 30s for docker info =="
+          ok=no
+          for i in $(seq 1 30); do
+            if sudo -n docker info </dev/null >/tmp/docker-info.txt 2>/tmp/docker-info.err \
+               || docker info >/tmp/docker-info.txt 2>/tmp/docker-info.err; then
+              ok=yes
+              echo "docker info succeeded after ${i}s"
+              break
+            fi
+            sleep 1
+          done
+
+          echo "== docker info result: ok=${ok} =="
+          echo "--- docker info stdout ---"
+          cat /tmp/docker-info.txt 2>&1 | head -60
+          echo "--- docker info stderr ---"
+          cat /tmp/docker-info.err 2>&1 | head -30
+
+          echo "== dockerd log (tail 120) =="
+          tail -120 "$LOG" 2>&1
+
+          echo "== is dockerd alive? =="
+          pgrep -a dockerd 2>&1; echo "pgrep rc=$?"
+          ps aux 2>&1 | grep -E 'dockerd|containerd' | grep -v grep
+
+          echo "ROOTFUL_DOCKERD_OK=${ok}"
+          exit 0
+
+      - name: Start dockerd (rootless) and other engines
+        continue-on-error: true
+        run: |
+          set +e
+          echo "== kill any rootful attempt =="
+          sudo -n pkill dockerd 2>/dev/null; pkill dockerd 2>/dev/null; sleep 2
+
+          LOG=/tmp/dockerd-rootless.log
+          : > "$LOG"
+
+          echo "== dockerd-rootless-setuptool.sh check =="
+          if command -v dockerd-rootless-setuptool.sh >/dev/null 2>&1; then
+            dockerd-rootless-setuptool.sh check 2>&1 | head -40
+            echo "check rc=$?"
+            dockerd-rootless-setuptool.sh install --skip-iptables --force 2>&1 | head -40
+            echo "install rc=$?"
+          else
+            echo "dockerd-rootless-setuptool.sh: <absent>"
+          fi
+
+          echo "== dockerd-rootless.sh =="
+          if command -v dockerd-rootless.sh >/dev/null 2>&1; then
+            export XDG_RUNTIME_DIR=/tmp/probe-xdg
+            mkdir -p "$XDG_RUNTIME_DIR"
+            nohup dockerd-rootless.sh --storage-driver=vfs --iptables=false \
+              >>"$LOG" 2>&1 </dev/null &
+            echo "waiting up to 30s"
+            ok=no
+            for i in $(seq 1 30); do
+              if DOCKER_HOST="unix://${XDG_RUNTIME_DIR}/docker.sock" docker info >/tmp/rootless-info.txt 2>/tmp/rootless-info.err; then
+                ok=yes; echo "rootless docker info succeeded after ${i}s"; break
+              fi
+              sleep 1
+            done
+            echo "ROOTLESS_DOCKERD_OK=${ok}"
+            echo "--- rootless docker info ---"; head -40 /tmp/rootless-info.txt 2>&1
+            echo "--- rootless docker info stderr ---"; head -20 /tmp/rootless-info.err 2>&1
+            echo "--- rootless dockerd log (tail 80) ---"; tail -80 "$LOG" 2>&1
+          else
+            echo "dockerd-rootless.sh: <absent>"
+            echo "ROOTLESS_DOCKERD_OK=absent"
+          fi
+
+          echo "== podman =="
+          if command -v podman >/dev/null 2>&1; then
+            podman info 2>&1 | head -40; echo "podman info rc=$?"
+          else
+            echo "podman: <absent>"
+          fi
+
+          echo "== buildah =="
+          if command -v buildah >/dev/null 2>&1; then
+            buildah info 2>&1 | head -40; echo "buildah info rc=$?"
+          else
+            echo "buildah: <absent>"
+          fi
+
+          echo "== containerd standalone =="
+          if command -v containerd >/dev/null 2>&1; then
+            sudo -n nohup containerd >/tmp/containerd.log 2>&1 </dev/null &
+            sleep 5
+            sudo -n ctr version 2>&1 | head -10
+            echo "--- containerd log tail ---"; tail -30 /tmp/containerd.log 2>&1
+          else
+            echo "containerd: <absent>"
+          fi
+          exit 0
+
+      - name: Teardown
+        continue-on-error: true
+        if: always()
+        run: |
+          set +e
+          sudo -n pkill -9 dockerd 2>/dev/null
+          sudo -n pkill -9 containerd 2>/dev/null
+          pkill -9 dockerd 2>/dev/null
+          pkill -9 containerd 2>/dev/null
+          pkill -9 rootlesskit 2>/dev/null
+          echo "teardown done"
+          exit 0
