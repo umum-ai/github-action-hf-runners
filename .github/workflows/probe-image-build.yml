@@ -135,12 +135,13 @@ jobs:
               done
           }
 
-          # Buildah re-execs itself into a fresh user namespace whenever it finds
-          # itself without CAP_SYS_ADMIN, which here dies on
-          # `unshare(CLONE_NEWUSER): Operation not permitted` before it does any
-          # work at all. _CONTAINERS_USERNS_CONFIGURED is the flag that says the
-          # namespace it wants is the one it is already in.
-          BH_ENV="_CONTAINERS_USERNS_CONFIGURED=done STORAGE_DRIVER=vfs"
+          # Buildah re-execs itself into a fresh user namespace whenever it is
+          # uid 0 without CAP_SYS_ADMIN, and here that dies on
+          # `unshare(CLONE_NEWUSER): Operation not permitted` before it reads a
+          # Dockerfile. It skips the re-exec when it is euid 0 *and* believes it
+          # is already the mapped root of somebody's namespace, which is what a
+          # non-zero _CONTAINERS_ROOTLESS_UID says.
+          BH_ENV="_CONTAINERS_ROOTLESS_UID=1001 _CONTAINERS_USERNS_CONFIGURED=done STORAGE_DRIVER=vfs"
 
           # run_buildah <label> <sudo-prefix> <extra buildah bud args...>
           run_buildah() {
@@ -235,26 +236,59 @@ jobs:
               sudo -n "$RUNC" --root "/tmp/runc-root-${name}" delete -f "probe-${name}" 2>/dev/null
           }
 
+          # Dropping a namespace means dropping what only that namespace can
+          # carry: `hostname` needs a private UTS namespace, masked/readonly
+          # paths and mounts need a private mount namespace.
           COMMON='.process.terminal=false
                   | .process.args=["/bin/echo","hello-from-the-container"]
                   | .root.readonly=false'
+          NONS='del(.hostname) | .linux.namespaces=[]
+                | del(.linux.maskedPaths) | del(.linux.readonlyPaths) | .mounts=[]'
 
           # Baseline: the spec runc itself generates, minus the tty it cannot open.
           try_spec default "${COMMON}"
 
           # No namespaces at all — the only shape this kernel could accept: a
           # plain chroot, which is exactly what cap_sys_chroot allows.
-          try_spec nons "${COMMON}
-            | .linux.namespaces=[] | del(.linux.maskedPaths) | del(.linux.readonlyPaths)
-            | .mounts=[]"
+          try_spec nons "${COMMON} | ${NONS}"
 
           # Same, and no cgroup either: cgroupfs here is mounted read-only.
-          try_spec nons-nocgroup "${COMMON}
-            | .linux.namespaces=[] | del(.linux.maskedPaths) | del(.linux.readonlyPaths)
-            | .mounts=[] | .linux.cgroupsPath=\"\" | del(.linux.resources)"
+          try_spec nons-nocgroup "${COMMON} | ${NONS}
+            | .linux.cgroupsPath=\"\" | del(.linux.resources)"
+
+          # Same again, run through runc's rootless path, which is the one that
+          # tolerates a cgroupfs it cannot write to.
+          jq "${COMMON} | ${NONS} | .linux.cgroupsPath=\"\" | del(.linux.resources)" \
+            /tmp/config-base.json >/tmp/config-nons-rootless.json 2>&1
+          sudo -n cp /tmp/config-nons-rootless.json "$B/config.json" </dev/null
+          sudo -n "$RUNC" --rootless true --root /tmp/runc-root-rl run probe-rl -b "$B" \
+            </dev/null >/tmp/runc-rootless.txt 2>&1
+          echo "RESULT runc nons-rootless rc=$?"
+          head -n 5 /tmp/runc-rootless.txt
 
           # A mount namespace only, to tell "cannot unshare" from "cannot mount".
-          try_spec mountns "${COMMON} | .linux.namespaces=[{\"type\":\"mount\"}]"
+          try_spec mountns "${COMMON} | del(.hostname)
+            | .linux.namespaces=[{\"type\":\"mount\"}]"
+          exit 0
+
+      - name: mount(2) — exactly which forms are refused
+        continue-on-error: true
+        run: |
+          set +e
+          mkdir -p /tmp/mnt-src /tmp/mnt-dst
+          echo probe >/tmp/mnt-src/file
+          for form in "--bind /tmp/mnt-src /tmp/mnt-dst" \
+                      "--rbind /tmp/mnt-src /tmp/mnt-dst" \
+                      "-t tmpfs none /tmp/mnt-dst" \
+                      "-t proc none /tmp/mnt-dst"; do
+            out=$(sudo -n mount $form </dev/null 2>&1)
+            echo "RESULT mount ${form} rc=$? err=${out}"
+            sudo -n umount /tmp/mnt-dst 2>/dev/null
+          done
+          echo "== the specific form buildkit needs: a read-only bind =="
+          out=$(sudo -n mount --bind -o ro /tmp/mnt-src /tmp/mnt-dst </dev/null 2>&1)
+          echo "RESULT mount ro-bind rc=$? err=${out}"
+          sudo -n umount /tmp/mnt-dst 2>/dev/null
           exit 0
 
       - name: BuildKit A — rootful, native snapshotter, host network
@@ -290,13 +324,13 @@ jobs:
           . /tmp/probe/lib.sh
           LOG=/tmp/bk-b.log
           ADDR=unix:///tmp/bk-b/buildkitd.sock
-          mkdir -p /tmp/bk-b /tmp/bk-b-root
-          export XDG_RUNTIME_DIR=/tmp/bk-b-xdg
-          mkdir -p "$XDG_RUNTIME_DIR"
+          sudo -n mkdir -p /tmp/bk-b /tmp/bk-b-root /tmp/bk-b-xdg </dev/null
 
           # The documented shape for a buildkitd that is already inside somebody
-          # else's user namespace and may not create another one.
-          /usr/local/bin/buildkitd \
+          # else's user namespace and may not create another one. It insists on
+          # being the mapped root of that namespace, which here means sudo.
+          sudo -n env "XDG_RUNTIME_DIR=/tmp/bk-b-xdg" \
+            /usr/local/bin/buildkitd \
             --root /tmp/bk-b-root \
             --addr "$ADDR" \
             --oci-worker=true --containerd-worker=false \
@@ -306,13 +340,13 @@ jobs:
             --oci-worker-net=host \
             --debug >"$LOG" 2>&1 </dev/null &
 
-          if wait_for_buildkitd "$ADDR" "" "$LOG"; then
-            run_buildctl b "$ADDR" ""
+          if wait_for_buildkitd "$ADDR" "sudo -n" "$LOG"; then
+            run_buildctl b "$ADDR" "sudo -n"
           else
             echo "RESULT buildkit b all rc=daemon-did-not-start"
           fi
-          echo "--- buildkitd B log tail ---"; tail -n 60 "$LOG" 2>&1
-          pkill -f 'buildkitd --root /tmp/bk-b-root' 2>/dev/null
+          echo "--- buildkitd B log tail ---"; sudo -n tail -n 60 "$LOG" 2>&1
+          sudo -n pkill -f 'buildkitd --root /tmp/bk-b-root' 2>/dev/null
           exit 0
 
       - name: BuildKit C — root uid, no-process-sandbox, via config file
