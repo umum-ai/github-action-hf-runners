@@ -471,8 +471,11 @@ jobs:
             echo "RESULT buildah manual ${label} rc=${rc} secs=$((t1-t0)) bytes=${size} stage=commit"
 
             echo "-- and can it execute a command in that container? --"
-            $BH run --isolation chroot "$ctr" -- /bin/echo hello </dev/null 2>&1 | tail -5
-            echo "RESULT buildah manual-run ${label} rc=$?"
+            $BH run --isolation chroot "$ctr" -- /bin/echo hello \
+              </dev/null >"/tmp/bh-run-${label}.txt" 2>&1
+            rc=$?
+            echo "RESULT buildah manual-run ${label} rc=${rc}"
+            tail -n 5 "/tmp/bh-run-${label}.txt"
           done
           exit 0
 
