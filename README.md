@@ -78,9 +78,12 @@ runs; nothing self-updates mid-job.
 
 ## Known limitations
 
-There is no docker in the image and no docker daemon in a Hugging Face Job. Jobs that use
-`services:`, `docker/setup-buildx-action`, `docker build`/`run`/`push`, or `docker compose`
-will not work on `hf-jobs-cpu-upgrade` and should stay on `ubuntu-latest` for now.
+The image does have a docker client — it arrives transitively with the dotfiles' global mise
+tool set rather than from the [`Dockerfile`](Dockerfile) — but a Hugging Face Job has no
+docker daemon for it to talk to. Jobs that use `services:`, `docker/setup-buildx-action`,
+`docker build`/`run`/`push`, or `docker compose` therefore fail on `hf-jobs-cpu-upgrade`
+partway through, with `Cannot connect to the Docker daemon at unix:///var/run/docker.sock`
+rather than a missing command, and should stay on `ubuntu-latest`.
 
 There is also no `/opt/hostedtoolcache`, so `actions/setup-node`, `actions/setup-python`
 and the rest of the `actions/setup-*` family download their toolchain on every run instead
