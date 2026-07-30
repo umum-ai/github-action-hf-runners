@@ -19,15 +19,9 @@ jobs:
     # GitHub-hosted on purpose: building the image needs a docker daemon, and the
     # HF Jobs runner this repository produces does not have one.
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
-
-      - name: Free up disk space
-        run: |
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
-                      /usr/local/share/boost "${AGENT_TOOLSDIRECTORY:-}" || true
-          df -h /
 
       - uses: docker/setup-buildx-action@v3
 
