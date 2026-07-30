@@ -55,7 +55,7 @@ jobs:
           curl -fsSL -o /tmp/buildkit.tar.gz \
             "https://github.com/moby/buildkit/releases/download/${BUILDKIT_VERSION}/buildkit-${BUILDKIT_VERSION}.linux-amd64.tar.gz"
           echo "download rc=$?"
-          sudo -n tar -xzf /tmp/buildkit.tar.gz -C /usr/local --strip-components=1 </dev/null
+          sudo -n tar -xzf /tmp/buildkit.tar.gz -C /usr/local </dev/null
           echo "extract rc=$?"
           ls -l /usr/local/bin/ 2>&1 | grep -E 'buildkit|buildctl'
           /usr/local/bin/buildkitd --version 2>&1
@@ -135,6 +135,13 @@ jobs:
               done
           }
 
+          # Buildah re-execs itself into a fresh user namespace whenever it finds
+          # itself without CAP_SYS_ADMIN, which here dies on
+          # `unshare(CLONE_NEWUSER): Operation not permitted` before it does any
+          # work at all. _CONTAINERS_USERNS_CONFIGURED is the flag that says the
+          # namespace it wants is the one it is already in.
+          BH_ENV="_CONTAINERS_USERNS_CONFIGURED=done STORAGE_DRIVER=vfs"
+
           # run_buildah <label> <sudo-prefix> <extra buildah bud args...>
           run_buildah() {
               label="$1"; shift
@@ -146,12 +153,12 @@ jobs:
                   log="/tmp/log-buildah-${label}-${case}.txt"
                   out="/tmp/out-buildah-${label}-${case}.tar"
                   t0=$(date +%s)
-                  $pfx buildah --storage-driver vfs --root "${root}/root" --runroot "${root}/run" \
+                  $pfx env $BH_ENV buildah --storage-driver vfs --root "${root}/root" --runroot "${root}/run" \
                       bud "$@" -f "/tmp/ctx/Dockerfile.${case}" \
                       -t "probe-${label}-${case}" /tmp/ctx >"$log" 2>&1 </dev/null
                   rc=$?
                   if [ "$rc" -eq 0 ]; then
-                      $pfx buildah --storage-driver vfs --root "${root}/root" --runroot "${root}/run" \
+                      $pfx env $BH_ENV buildah --storage-driver vfs --root "${root}/root" --runroot "${root}/run" \
                           push "probe-${label}-${case}" "oci-archive:${out}" >>"$log" 2>&1 </dev/null
                       rc=$?
                   fi
@@ -378,8 +385,10 @@ jobs:
         run: |
           set +e
           . /tmp/probe/lib.sh
-          echo "== buildah info (root) =="
-          sudo -n buildah --storage-driver vfs info </dev/null 2>&1 | head -30
+          echo "== buildah info, untouched: what it does when left to itself =="
+          sudo -n buildah --storage-driver vfs info </dev/null 2>&1 | head -10
+          echo "== buildah info, told the user namespace is already there =="
+          sudo -n env $BH_ENV buildah --storage-driver vfs info </dev/null 2>&1 | head -30
           run_buildah chroot "sudo -n" --isolation chroot
           exit 0
 
@@ -395,10 +404,11 @@ jobs:
         continue-on-error: true
         run: |
           set +e
+          . /tmp/probe/lib.sh
           root=/tmp/bh-manual
           sudo -n rm -rf "$root" </dev/null
           sudo -n mkdir -p "$root/root" "$root/run" </dev/null
-          BH="sudo -n buildah --storage-driver vfs --root ${root}/root --runroot ${root}/run"
+          BH="sudo -n env $BH_ENV buildah --storage-driver vfs --root ${root}/root --runroot ${root}/run"
 
           for base in scratch "${BASE_IMAGE}"; do
             label=$(echo "$base" | tr ':/' '--')
