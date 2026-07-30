@@ -47,10 +47,30 @@ Ubuntu 24.04 with a pinned [`actions/runner`](https://github.com/actions/runner)
 the dependencies `installdependencies.sh` asks for, and the set of command-line tools that
 workflows written against `ubuntu-latest` quietly assume: `zstd` (used by `actions/cache`
 and `actions/upload-artifact`, which fall back to a much slower gzip path without it),
-`file`, `pkg-config`, `gawk`, `gettext-base`, `sqlite3`, `postgresql-client`, and the usual
-network debugging handful (`ip`, `ping`, `dig`, `lsof`, `nc`). It also carries the shared
-libraries Chromium links against, so `pnpm exec playwright install chromium` works without
-`--with-deps` and without an apt round-trip on every run.
+`file`, `pkg-config`, `gawk`, `gettext-base`, `sqlite3`, and the usual network debugging
+handful (`ip`, `ping`, `dig`, `lsof`, `nc`). It also carries the shared libraries Chromium
+links against, so `pnpm exec playwright install chromium` works without `--with-deps` and
+without an apt round-trip on every run.
+
+PostgreSQL 17 is in the image as a server, not only a client. Both come from
+[PGDG](https://apt.postgresql.org), because Ubuntu 24.04 itself carries only the 16 branch,
+and `/usr/lib/postgresql/17/bin` is on `PATH`, so `initdb`, `pg_ctl`, `pg_isready`,
+`createdb` and `psql` resolve inside a step without a full path. This is how a job gets a
+database here — `services:` needs a docker daemon, and these runners have none. The image
+ships no cluster of its own; the job creates the one it wants:
+
+```yaml
+- name: Start PostgreSQL
+  run: |
+    initdb -D "$RUNNER_TEMP/pgdata" --auth=trust
+    pg_ctl -D "$RUNNER_TEMP/pgdata" -l "$RUNNER_TEMP/pg.log" -o "-k $RUNNER_TEMP" start
+    createdb -h 127.0.0.1 myapp_test
+```
+
+The `-k` is not optional: a step runs as `runner`, and the socket directory compiled into
+the server, `/var/run/postgresql`, belongs to `postgres`, so a cluster started without it
+dies creating its lock file. With it, the cluster answers on `127.0.0.1:5432` as well as on
+the socket, so a `DATABASE_URL` pointed at `localhost` needs no change.
 
 Language toolchains do not come from the image. The build applies
 [kvokka's dotfiles](https://github.com/kvokka/dotfiles) with chezmoi, which installs
@@ -75,9 +95,10 @@ Nothing reaches GHCR unverified. [`publish.yml`](.github/workflows/publish.yml) 
 image into the runner's own docker daemon, runs [`smoke.sh`](smoke.sh) against it, and
 pushes only if that passes. The script checks that the advertised tool set *works* rather
 than merely being installed: `jq` parses a document, `zstd` survives a round trip, `sqlite3`
-creates a table and reads it back, `envsubst` expands a variable, the Chromium shared
-libraries are in the linker cache, the runner binary reports the version the image
-advertises, and `core.hooksPath` is unset in both the global and the system git config.
+creates a table and reads it back, `envsubst` expands a variable, an `initdb` cluster starts
+and answers `SELECT 1` before being stopped again, the Chromium shared libraries are in the
+linker cache, the runner binary reports the version the image advertises, and
+`core.hooksPath` is unset in both the global and the system git config.
 Every check runs in a non-login, non-interactive shell — the shell a workflow step gets —
 so a tool that only resolves out of shell initialization fails here exactly as it would in
 a job.
