@@ -1,0 +1,5 @@
+# Every pull request in this repository requests review from the owner,
+# including the ones no agent opened. The `reviewers` key of dependabot.yml was
+# removed by GitHub on 2025-05-20; code owners is what remains. This requests a
+# review — it gates no merge, because no branch protection rule refers to it.
+* @kvokka

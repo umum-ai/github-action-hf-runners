@@ -1,0 +1,30 @@
+# One weekly pull request for this repository. Every ecosystem entry joins the
+# `weekly` multi-ecosystem group, so a week's updates arrive together instead of
+# one pull request per dependency. `patterns: ["*"]` puts the whole ecosystem in
+# scope.
+# No entry carries `cooldown`: it is stated in semver days, and no ecosystem
+# this repository holds reads them.
+version: 2
+
+multi-ecosystem-groups:
+  weekly:
+    schedule:
+      interval: weekly
+      day: monday
+      time: "04:20"
+      timezone: Etc/UTC
+    labels: ["dependencies"]
+
+updates:
+  # The base image the CI runner is built on. Every job in the organization
+  # runs inside it.
+  - package-ecosystem: docker
+    directory: "/"
+    patterns: ["*"]
+    multi-ecosystem-group: weekly
+
+  # `/` covers all of .github/**, composite actions included.
+  - package-ecosystem: github-actions
+    directory: "/"
+    patterns: ["*"]
+    multi-ecosystem-group: weekly
