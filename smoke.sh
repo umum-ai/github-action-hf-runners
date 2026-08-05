@@ -15,8 +15,10 @@
 # here too.
 #
 # `jobs-actions-runner` adds its entrypoint. `space-runner` adds its supervisor, the
-# interpreter and the signing tool it needs, and then starts the image for real
-# and reads its health endpoint from outside the container.
+# interpreter and the signing tool it needs, and then starts the image for real,
+# twice — with no credentials and with a `GH_APP_PRIVATE_KEY` that is not the
+# base64 of a PEM — and reads its health endpoint from outside the container each
+# time, because each has its own reason to report.
 #
 # The first failed check exits non-zero and says what did not match.
 
@@ -316,14 +318,20 @@ printf '%s\n\nprintf "\\nsmoke: in-container checks passed\\n"\n' "$checks" \
 
 # --- the Space image, started for real --------------------------------------
 # The health server is the one thing a Space cannot be without, so it is checked
-# by running the published entrypoint and reading the endpoint over TCP. With no
-# credentials in the environment the supervisor reports `misconfigured` and keeps
-# answering, which is exactly the state a Space has to stay diagnosable in.
+# by running the published entrypoint and reading the endpoint over TCP. It is
+# started twice, once for each way a Space can be misconfigured: with no
+# credentials at all, and with a `GH_APP_PRIVATE_KEY` that is not the base64 of a
+# PEM. Both keep answering — which is exactly the state a Space has to stay
+# diagnosable in — and both have to say which of the two happened, because the only
+# other place that says it is a Space log that needs an owner token to read.
 
-if [ "$mode" = "space-runner" ]; then
-    container=$(docker run -d --rm -p 127.0.0.1:0:7860 "${image}")
-    # shellcheck disable=SC2064 # the id is wanted now, not when the trap fires
-    trap "docker rm -f '${container}' >/dev/null 2>&1 || true" EXIT
+container=""
+endpoint=""
+
+# Starts the image with the environment given as arguments and waits until `/`
+# answers. Sets `container` and `endpoint`.
+start_space_runner() {
+    container=$(docker run -d --rm -p 127.0.0.1:0:7860 "$@" "${image}")
 
     endpoint=$(docker port "${container}" 7860/tcp | head -n 1)
     [ -n "$endpoint" ] || { echo "FAIL: the container published no port" >&2; exit 1; }
@@ -342,23 +350,58 @@ if [ "$mode" = "space-runner" ]; then
         sleep 2
     done
     echo "ok  the health server answers on ${endpoint}/"
+}
 
-    body=$(curl -fsS --max-time 5 "http://${endpoint}/")
-    for field in state runner_alive jobs_taken image_revision healthy; do
+stop_space_runner() {
+    [ -n "$container" ] || return 0
+    docker rm -f "$container" >/dev/null 2>&1 || true
+    container=""
+}
+
+# The endpoint answers from the moment the health server binds, which is before
+# the supervisor has looked at its environment — so `starting` is not an answer to
+# assert against. Prints the payload the supervisor has settled on.
+space_payload() {
+    local payload state deadline=$((SECONDS + 30))
+    while true; do
+        payload=$(curl -fsS --max-time 5 "http://${endpoint}/") || payload=""
+        state=$(printf '%s' "$payload" | jq -r '.state // empty' 2>/dev/null || true)
+        if [ -n "$state" ] && [ "$state" != "starting" ]; then
+            printf '%s' "$payload"
+            return 0
+        fi
+        if [ "$SECONDS" -ge "$deadline" ]; then
+            echo "FAIL: the supervisor was still 'starting' after 30s: ${payload}" >&2
+            docker logs "${container}" 2>&1 | tail -n 30 >&2
+            exit 1
+        fi
+        sleep 1
+    done
+}
+
+if [ "$mode" = "space-runner" ]; then
+    trap 'stop_space_runner' EXIT
+
+    # --- no credentials at all ----------------------------------------------
+    start_space_runner
+
+    body=$(space_payload)
+    for field in state reason runner_alive jobs_taken image_revision healthy; do
         printf '%s' "$body" | jq -e "has(\"${field}\")" >/dev/null \
             || { echo "FAIL: the health payload has no ${field}: ${body}" >&2; exit 1; }
     done
     echo "ok  the health payload reports ${body}"
 
     # Nothing a public reader must not see: no organization, no runner name, no
-    # token, no label set.
-    for leak in token org organization runner_name labels installation; do
+    # token, no label set, and no credential under any name of its own.
+    for leak in token org organization runner_name labels installation \
+                key private_key app_id space_id; do
         if printf '%s' "$body" | jq -e "has(\"${leak}\")" >/dev/null 2>&1; then
             echo "FAIL: the public health payload exposes ${leak}" >&2
             exit 1
         fi
     done
-    echo "ok  the health payload exposes nothing but liveness, count and revision"
+    echo "ok  the health payload exposes nothing but liveness, count, revision and a reason"
 
     alive=$(printf '%s' "$body" | jq -r '.runner_alive')
     [ "$alive" = "true" ] \
@@ -376,6 +419,22 @@ if [ "$mode" = "space-runner" ]; then
     }
     echo "ok  with no credentials the supervisor reports misconfigured and stays up"
 
+    # The whole point of the field: `misconfigured` alone sends a reader to a log
+    # that needs a token, so the payload names the variables that are unset.
+    reason=$(printf '%s' "$body" | jq -r '.reason // empty')
+    case "$reason" in
+        *"required environment variables are not set"*) ;;
+        *) echo "FAIL: with no credentials the reason is '${reason}', which does not name the unset variables" >&2
+           exit 1 ;;
+    esac
+    for var in GH_APP_ID GH_ORG GH_APP_PRIVATE_KEY SPACE_ID; do
+        case "$reason" in
+            *"$var"*) ;;
+            *) echo "FAIL: the reason does not name ${var}, which is unset: ${reason}" >&2; exit 1 ;;
+        esac
+    done
+    echo "ok  the reason names every unset variable (${reason})"
+
     status=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "http://${endpoint}/health")
     [ "$status" = "503" ] \
         || { echo "FAIL: /health answered ${status} for a runner that cannot register, expected 503" >&2; exit 1; }
@@ -385,6 +444,55 @@ if [ "$mode" = "space-runner" ]; then
     [ "$status" = "200" ] \
         || { echo "FAIL: / answered ${status}, expected 200 — a Space that stops answering is stopped" >&2; exit 1; }
     echo "ok  / answers 200 regardless, which is what keeps the Space alive"
+
+    stop_space_runner
+
+    # --- every variable set, but the key is not base64 of a PEM -------------
+    # The failure the three live Spaces are actually in. The value below is not a
+    # credential, and the payload has to prove it never became one: the reason may
+    # state the key's shape and nothing about its content.
+    bad_key='not_valid_base64_1a2b3c4d5e'
+    start_space_runner \
+        -e GH_APP_ID=1 \
+        -e GH_ORG=umum-ai \
+        -e SPACE_ID=namespace/smoke \
+        -e "GH_APP_PRIVATE_KEY=${bad_key}"
+
+    body=$(space_payload)
+    echo "ok  the health payload reports ${body}"
+
+    state=$(printf '%s' "$body" | jq -r '.state')
+    [ "$state" = "misconfigured" ] || {
+        echo "FAIL: with an undecodable key the supervisor reports '${state}', not 'misconfigured'" >&2
+        docker logs "${container}" 2>&1 | tail -n 30 >&2
+        exit 1
+    }
+
+    reason=$(printf '%s' "$body" | jq -r '.reason // empty')
+    [ "$reason" = "GH_APP_PRIVATE_KEY is not the base64 of a PEM private key" ] || {
+        echo "FAIL: with an undecodable key the reason is '${reason}'" >&2
+        docker logs "${container}" 2>&1 | tail -n 30 >&2
+        exit 1
+    }
+    echo "ok  an undecodable key is reported as ${reason}"
+
+    # Neither the value nor a piece of it: a reason states a shape, and nothing
+    # read out of the credential itself ever reaches this document.
+    for fragment in "$bad_key" 1a2b3c4d5e; do
+        case "$body" in
+            *"$fragment"*)
+                echo "FAIL: the public payload repeats part of the credential value: ${body}" >&2
+                exit 1 ;;
+        esac
+    done
+    echo "ok  the payload carries nothing taken from the credential value"
+
+    status=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "http://${endpoint}/health")
+    [ "$status" = "503" ] \
+        || { echo "FAIL: /health answered ${status} for a runner with an undecodable key, expected 503" >&2; exit 1; }
+    echo "ok  /health answers 503 while the key cannot be decoded"
+
+    stop_space_runner
 fi
 
 printf '\nsmoke: all checks passed\n'

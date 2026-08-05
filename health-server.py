@@ -10,10 +10,12 @@ container that cannot register must still be reachable to be diagnosed at all.
 `/health` answers 200 only while the runner is actually working, and 503
 otherwise; that is what the scheduled check in this repository asserts.
 
-The Spaces are public, so the payload is deliberately three facts and nothing
+The Spaces are public, so the payload is deliberately four facts and nothing
 else: whether the supervisor process is alive, how many jobs this container has
-taken, and the commit its image was built from. No organization, no runner name,
-no labels, no token.
+taken, the commit its image was built from, and why it is not working when it is
+not — `reason`, one of the fixed sentences `supervisor.sh` writes into the state
+file, and null when the supervisor has nothing to report. No organization, no
+runner name, no labels, no token, and nothing derived from a credential value.
 """
 
 import json
@@ -30,6 +32,11 @@ IMAGE_REVISION = os.environ.get("IMAGE_REVISION", "unknown")
 # because a Space that answers while it can never take a job is the failure this
 # endpoint exists to surface.
 HEALTHY_STATES = frozenset({"starting", "registering", "waiting-for-job"})
+
+# The longest reason served. The supervisor's sentences are far shorter; this is
+# what keeps a state file that somehow says otherwise from being republished
+# wholesale on a public endpoint.
+REASON_MAX_CHARS = 200
 
 STARTED_AT = time.time()
 
@@ -54,8 +61,19 @@ def snapshot():
         except OSError:
             supervisor_alive = False
 
+    # Served as written and never rephrased here: the supervisor is the only
+    # writer of reasons and its whole catalogue is literals of that script. A
+    # value of any other type is no reason at all, and length is bounded because
+    # this is a public document.
+    reason = state.get("reason")
+    if not isinstance(reason, str) or not reason.strip():
+        reason = None
+    else:
+        reason = reason.strip()[:REASON_MAX_CHARS]
+
     payload = {
         "state": state.get("state", "unknown"),
+        "reason": reason,
         "runner_alive": supervisor_alive,
         "jobs_taken": state.get("jobs_taken", 0),
         "image_revision": state.get("image_revision", IMAGE_REVISION),

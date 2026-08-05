@@ -54,8 +54,15 @@ jobs:
 
           payload="${body%$'\n'*}"
 
+          # A Space that cannot take a job answers 503 with a payload that says
+          # why, so the payload is read before the status is judged: the reason
+          # belongs in the annotation of the failure, which is all a reader of a
+          # failed run sees. It is empty when nothing answered at all.
+          state=$(printf '%s' "${payload}" | jq -r '.state // empty' 2>/dev/null || true)
+          reason=$(printf '%s' "${payload}" | jq -r '.reason // empty' 2>/dev/null || true)
+
           if [[ "${status}" != "200" ]]; then
-            echo "::error title=${{ matrix.space }}::${URL} answered ${status:-nothing} after five attempts"
+            echo "::error title=${{ matrix.space }}::${URL} answered ${status:-nothing} after five attempts${reason:+ — ${state:-unknown}: ${reason}}"
             echo "${payload}" | head -c 500
             exit 1
           fi
@@ -64,11 +71,10 @@ jobs:
 
           healthy=$(printf '%s' "${payload}" | jq -r '.healthy // false')
           if [[ "${healthy}" != "true" ]]; then
-            echo "::error title=${{ matrix.space }}::the Space answers but reports itself unhealthy"
+            echo "::error title=${{ matrix.space }}::the Space answers but reports itself unhealthy${reason:+ — ${state:-unknown}: ${reason}}"
             exit 1
           fi
 
-          state=$(printf '%s' "${payload}" | jq -r '.state')
           taken=$(printf '%s' "${payload}" | jq -r '.jobs_taken')
           revision=$(printf '%s' "${payload}" | jq -r '.image_revision')
           echo "::notice title=${{ matrix.space }}::${state}, ${taken} jobs taken, image ${revision}"

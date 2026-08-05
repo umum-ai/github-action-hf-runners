@@ -50,12 +50,30 @@ boot_epoch=$(date +%s)
 
 log() { printf '%s supervisor: %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*"; }
 
+# Every reason this supervisor can report, and the only ones. A state in which the
+# runner cannot take a job carries one of these into the state file, so the health
+# endpoint says why and not merely that: the Space's own log says it too, and that
+# log needs an owner token nobody polling the endpoint has.
+#
+# They are literals of this script and they stay that way. A reason states which
+# variable is unset, what shape a credential failed to have, or what the GitHub API
+# did not return; it is never derived from a credential's value — not a prefix, not
+# a length, not a hash — and never a body an API sent back, because the Spaces are
+# public and the endpoint has no authentication. Being literals is also why none of
+# them carries a `"` or a `\`: the state file is written with printf, and a reason
+# is fixed text rather than input.
+REASON_MISSING_ENV="required environment variables are not set"
+REASON_UNDECODABLE_KEY="GH_APP_PRIVATE_KEY is not the base64 of a PEM private key"
+REASON_NO_INSTALLATION_TOKEN="the GitHub API did not return an installation token for this organization"
+REASON_NO_JIT_CONFIG="the GitHub API did not return a just-in-time runner configuration"
+
 # Written whole and moved into place, so the health server never reads half a
 # document. `supervisor_pid` is how that server knows this process is still there.
 write_state() {
-    local state="$1"
-    printf '{"state":"%s","jobs_taken":%d,"image_revision":"%s","supervisor_pid":%d,"updated_at":%d}\n' \
-        "$state" "$jobs_taken" "$IMAGE_REVISION" "$$" "$(date +%s)" >"${STATE_FILE}.tmp" \
+    local state="$1" reason="${2:-}" reason_json="null"
+    [[ -n "$reason" ]] && reason_json="\"${reason}\""
+    printf '{"state":"%s","reason":%s,"jobs_taken":%d,"image_revision":"%s","supervisor_pid":%d,"updated_at":%d}\n' \
+        "$state" "$reason_json" "$jobs_taken" "$IMAGE_REVISION" "$$" "$(date +%s)" >"${STATE_FILE}.tmp" \
         && mv "${STATE_FILE}.tmp" "$STATE_FILE"
 }
 
@@ -164,8 +182,11 @@ main() {
         # Not an exit: a Space that dies is restarted until the platform gives up
         # and its logs are gone. One that answers `misconfigured` says what it is
         # missing, and the scheduled check reports it as unhealthy.
+        #
+        # The names come from the fixed list above, so naming them tells a reader
+        # which variable to set without saying anything about any value.
         log "missing required environment: ${missing[*]}"
-        write_state misconfigured
+        write_state misconfigured "${REASON_MISSING_ENV}: ${missing[*]}"
         wait "$health_pid"
         exit 1
     fi
@@ -174,8 +195,8 @@ main() {
     chmod 600 "$key_file"
     if ! printf '%s' "$GH_APP_PRIVATE_KEY" | base64 -d >"$key_file" 2>/dev/null \
         || ! grep -q "PRIVATE KEY" "$key_file"; then
-        log "GH_APP_PRIVATE_KEY is not the base64 of a PEM private key"
-        write_state misconfigured
+        log "$REASON_UNDECODABLE_KEY"
+        write_state misconfigured "$REASON_UNDECODABLE_KEY"
         wait "$health_pid"
         exit 1
     fi
@@ -197,7 +218,7 @@ main() {
             || ! token=$(api POST "/app/installations/${install}/access_tokens" "$jwt" | jq -r '.token // empty') \
             || [[ -z "$token" ]]; then
             log "could not mint an installation token for ${GH_ORG}; retrying in ${backoff}s"
-            write_state error-backoff
+            write_state error-backoff "$REASON_NO_INSTALLATION_TOKEN"
             sleep "$backoff"
             backoff=$((backoff < 300 ? backoff * 2 : 300))
             continue
@@ -212,7 +233,7 @@ main() {
         name="${runner_base}-${boot_epoch}-${jobs_taken}"
         if ! encoded=$(jit_config "$token" "$name") || [[ -z "$encoded" ]]; then
             log "could not get a just-in-time configuration; retrying in ${backoff}s"
-            write_state error-backoff
+            write_state error-backoff "$REASON_NO_JIT_CONFIG"
             sleep "$backoff"
             backoff=$((backoff < 300 ? backoff * 2 : 300))
             continue
