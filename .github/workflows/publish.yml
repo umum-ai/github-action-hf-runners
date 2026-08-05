@@ -4,6 +4,7 @@ on:
   push:
     branches: [main]
     tags: ["v*"]
+  pull_request:
   workflow_dispatch:
 
 permissions:
@@ -15,46 +16,79 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  image:
-    # GitHub-hosted on purpose: building the image needs a docker daemon, and the
-    # HF Jobs runner this repository produces does not have one.
+  dockerfiles:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
-    env:
-      # `main` and `v*` tags are the refs that reach GHCR. Every other ref still
-      # builds the image and runs the smoke tests, it just keeps the result.
-      PUBLISH: ${{ github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v') }}
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        dockerfile: [Dockerfile.base, Dockerfile.jobs-runner, Dockerfile.space-runner]
     steps:
       - uses: actions/checkout@v4
 
-      - uses: docker/setup-buildx-action@v3
+      - uses: hadolint/hadolint-action@v3.1.0
+        with:
+          dockerfile: ${{ matrix.dockerfile }}
+          config: .hadolint.yaml
 
-      - name: Compute tags
+  scripts:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Shell check
+        run: shellcheck smoke.sh entrypoint.sh supervisor.sh
+
+      - name: Compile the health server
+        run: python3 -m py_compile health-server.py
+
+  images:
+    needs: [dockerfiles, scripts]
+    # GitHub-hosted on purpose: building an image needs a docker daemon, and no
+    # Hugging Face runner this repository produces has one.
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      # `main` and `v*` tags are the refs that reach GHCR. Every other ref still
+      # builds all three images and runs the smoke tests, it just keeps the result.
+      PUBLISH: ${{ github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v') }}
+      REGISTRY: ghcr.io/${{ github.repository }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compute the version tag
         id: meta
         run: |
-          image="ghcr.io/${{ github.repository_owner }}/jobs-actions-runner"
-          tags="${image}:latest,${image}:${{ github.sha }}"
+          version=""
           if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
-            tags="${tags},${image}:${GITHUB_REF#refs/tags/}"
+            version="${GITHUB_REF#refs/tags/}"
           fi
-          echo "tags=${tags}" >> "$GITHUB_OUTPUT"
-          echo "smoke_ref=${image}:${{ github.sha }}" >> "$GITHUB_OUTPUT"
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
 
-      # Into the runner's docker daemon, not to the registry: the image has to
-      # pass the smoke tests below before anything is published.
-      - name: Build image
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: Dockerfile
-          platforms: linux/amd64
-          load: true
-          push: false
-          provenance: false
-          tags: ${{ steps.meta.outputs.tags }}
+      # Into the runner's own docker daemon, not to the registry: an image has to
+      # pass its smoke checks before anything is published, and the derived images
+      # build `FROM` the base that has just passed them rather than from whatever
+      # the registry currently serves.
+      - name: Build and smoke-test base
+        run: |
+          docker build --file Dockerfile.base --tag "${REGISTRY}/base:${GITHUB_SHA}" .
+          ./smoke.sh base "${REGISTRY}/base:${GITHUB_SHA}"
 
-      - name: Smoke-test image
-        run: ./smoke.sh "${{ steps.meta.outputs.smoke_ref }}"
+      - name: Build and smoke-test jobs-runner
+        run: |
+          docker build --file Dockerfile.jobs-runner \
+            --build-arg "BASE_IMAGE=${REGISTRY}/base:${GITHUB_SHA}" \
+            --tag "${REGISTRY}/jobs-runner:${GITHUB_SHA}" .
+          ./smoke.sh jobs-runner "${REGISTRY}/jobs-runner:${GITHUB_SHA}"
+
+      - name: Build and smoke-test space-runner
+        run: |
+          docker build --file Dockerfile.space-runner \
+            --build-arg "BASE_IMAGE=${REGISTRY}/base:${GITHUB_SHA}" \
+            --build-arg "IMAGE_REVISION=${GITHUB_SHA}" \
+            --tag "${REGISTRY}/space-runner:${GITHUB_SHA}" .
+          ./smoke.sh space-runner "${REGISTRY}/space-runner:${GITHUB_SHA}"
 
       - uses: docker/login-action@v3
         if: env.PUBLISH == 'true'
@@ -63,11 +97,20 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # Pushes the very bytes the smoke tests ran against.
-      - name: Push image
+      # Pushes the very bytes the smoke tests ran against: `latest` and the version
+      # tag are further names for the image the commit sha already identifies.
+      - name: Push images
         if: env.PUBLISH == 'true'
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
         run: |
-          IFS=',' read -ra refs <<< "${{ steps.meta.outputs.tags }}"
-          for ref in "${refs[@]}"; do
-            docker push "${ref}"
+          for name in base jobs-runner space-runner; do
+            built="${REGISTRY}/${name}:${GITHUB_SHA}"
+            docker tag "${built}" "${REGISTRY}/${name}:latest"
+            docker push "${built}"
+            docker push "${REGISTRY}/${name}:latest"
+            if [[ -n "${VERSION}" ]]; then
+              docker tag "${built}" "${REGISTRY}/${name}:${VERSION}"
+              docker push "${REGISTRY}/${name}:${VERSION}"
+            fi
           done

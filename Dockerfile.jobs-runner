@@ -1,0 +1,16 @@
+# The ephemeral Hugging Face Jobs runner: the base image plus the entrypoint the
+# dispatcher executes. It is handed a one-shot registration token, registers
+# against one repository, takes one job and exits with the container.
+#
+# `BASE_IMAGE` is a build argument so that the publish workflow can point this
+# build at the `base` image it has just built and smoke-tested locally, rather
+# than at whatever the registry currently serves.
+ARG BASE_IMAGE=ghcr.io/umum-ai/github-action-hf-runners/base:latest
+# The tag lives in the argument above, whose default carries one.
+# hadolint ignore=DL3006
+FROM ${BASE_IMAGE}
+
+COPY --chown=runner:runner entrypoint.sh /entrypoint.sh
+RUN sudo chmod +x /entrypoint.sh
+
+ENTRYPOINT ["/entrypoint.sh"]

@@ -1,0 +1,49 @@
+# The long-lived Space runner: the base image plus a supervisor that registers a
+# fresh just-in-time runner for every job, and a health server that answers on the
+# Space's `app_port`.
+#
+# `BASE_IMAGE` is a build argument so that the publish workflow can point this
+# build at the `base` image it has just built and smoke-tested locally, rather
+# than at whatever the registry currently serves.
+ARG BASE_IMAGE=ghcr.io/umum-ai/github-action-hf-runners/base:latest
+# The tag lives in the argument above, whose default carries one.
+# hadolint ignore=DL3006
+FROM ${BASE_IMAGE}
+
+# The commit this image was built from. The health endpoint reports it, so the
+# Space can be told apart from the image the registry currently serves.
+ARG IMAGE_REVISION=unknown
+
+USER root
+
+# `openssl` signs the GitHub App JWT and `python3` runs the health server. Both
+# belong to this image rather than to the base: they are what being a Space costs,
+# and neither is part of the toolchain a job uses. `python3` here is the
+# distribution's, deliberately not the toolchain's `python` — a health server that
+# the Space is killed without must not depend on what the dotfiles resolve to.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    openssl \
+    python3 \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --chown=runner:runner supervisor.sh /supervisor.sh
+COPY --chown=runner:runner health-server.py /health-server.py
+RUN chmod +x /supervisor.sh /health-server.py
+
+ENV IMAGE_REVISION=${IMAGE_REVISION} \
+    RUNNER_LABELS=hf-spaces \
+    RUNNER_GROUP_ID=1 \
+    APP_PORT=7860 \
+    STATE_FILE=/tmp/runner-state.json
+
+# A Hugging Face Space reaches the container on `app_port` and nothing else, and
+# a Space that does not answer there within `startup_duration_timeout` is stopped.
+EXPOSE 7860
+
+# Spelled as the number, not as the name: a Space runs its container as uid 1000
+# whatever the image asks for, and this is where that is visible. The base image
+# gave `runner` that uid.
+USER 1000
+WORKDIR /actions-runner
+
+ENTRYPOINT ["/supervisor.sh"]

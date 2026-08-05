@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# Entrypoint for the jobs-actions runner container.
+# Entrypoint for the ephemeral Hugging Face Jobs runner container.
 #
 # Required env vars (set by the dispatcher):
 #   GH_REPO         - "owner/name"
@@ -21,7 +21,7 @@ set -euo pipefail
 : "${RUNNER_GROUP:=default}"
 : "${RUNNER_WORKDIR:=_work}"
 
-echo "jobs-actions runner starting"
+echo "hf jobs runner starting"
 echo "  repo:    ${GH_REPO}"
 echo "  labels:  ${RUNNER_LABELS}"
 echo "  name:    ${RUNNER_NAME}"
@@ -35,7 +35,7 @@ sudo git config --system --unset-all core.hooksPath || true
 cd /actions-runner
 
 cleanup() {
-    echo "jobs-actions runner: cleanup"
+    echo "hf jobs runner: cleanup"
     if [[ -f .runner ]]; then
         ./config.sh remove --token "${RUNNER_TOKEN}" 2>/dev/null || true
     fi
