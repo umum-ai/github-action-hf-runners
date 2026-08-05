@@ -7,12 +7,15 @@
 # its own registration, so there is no removal token to hold and no cleanup trap
 # to get right — a container killed mid-job leaves nothing behind on GitHub.
 #
-# Required env (a Space variable or a Space secret, set by `siam-infra`):
+# Required env. The first three are a Space variable or a Space secret, set by
+# `siam-infra`; the fourth is injected into every Space by Hugging Face itself, so
+# a Space's own identity is never configuration anybody has to keep in step:
 #   GH_APP_ID           GitHub App id
+#   GH_ORG              organization the runner joins
 #   GH_APP_PRIVATE_KEY  base64 of the App's PEM private key; a PEM cannot travel
 #                       as a single-line value
-#   ORG_NAME            organization the runner joins
-#   RUNNER_NAME         what distinguishes this Space from the other Spaces
+#   SPACE_ID            `<namespace>/<space>`, which is where the runner name
+#                       comes from
 #
 # Optional env, all defaulted in the image:
 #   RUNNER_LABELS       comma-separated, default `hf-spaces`
@@ -38,6 +41,12 @@ export APP_PORT STATE_FILE IMAGE_REVISION
 jobs_taken=0
 health_pid=""
 key_file=""
+runner_base=""
+
+# Fixed for the life of this container, and half of what makes a runner name
+# unique: the counter separates one registration from the next, this separates
+# this container's names from those a previous one may still hold.
+boot_epoch=$(date +%s)
 
 log() { printf '%s supervisor: %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*"; }
 
@@ -120,7 +129,7 @@ api() {
 installation_id() {
     local jwt="$1" payload
     payload=$(api GET /app/installations "$jwt") || return 1
-    printf '%s' "$payload" | jq -r --arg org "$ORG_NAME" \
+    printf '%s' "$payload" | jq -r --arg org "$GH_ORG" \
         'map(select(.account.login == $org)) | first | .id // empty'
 }
 
@@ -134,7 +143,7 @@ jit_config() {
         --arg labels "$RUNNER_LABELS" \
         --arg work "$RUNNER_WORKDIR" \
         '{name: $name, runner_group_id: $group, labels: ($labels | split(",")), work_folder: $work}') || return 1
-    payload=$(api POST "/orgs/${ORG_NAME}/actions/runners/generate-jitconfig" "$token" "$body") || return 1
+    payload=$(api POST "/orgs/${GH_ORG}/actions/runners/generate-jitconfig" "$token" "$body") || return 1
     printf '%s' "$payload" | jq -r '.encoded_jit_config // empty'
 }
 
@@ -147,7 +156,7 @@ main() {
     start_health_server
 
     local missing=()
-    for var in GH_APP_ID GH_APP_PRIVATE_KEY ORG_NAME RUNNER_NAME; do
+    for var in GH_APP_ID GH_ORG GH_APP_PRIVATE_KEY SPACE_ID; do
         [[ -n "${!var:-}" ]] || missing+=("$var")
     done
 
@@ -171,7 +180,10 @@ main() {
         exit 1
     fi
 
-    log "runner ${RUNNER_NAME} for organization ${ORG_NAME}, labels ${RUNNER_LABELS}"
+    # `SPACE_ID` is `<namespace>/<space>`; the space part is what tells the three
+    # Spaces apart, and it needs no variable of its own to say so.
+    runner_base="${SPACE_ID##*/}"
+    log "runner ${runner_base} for organization ${GH_ORG}, labels ${RUNNER_LABELS}"
     log "image revision ${IMAGE_REVISION}"
 
     local backoff=15
@@ -184,15 +196,20 @@ main() {
             || ! install=$(installation_id "$jwt") || [[ -z "$install" ]] \
             || ! token=$(api POST "/app/installations/${install}/access_tokens" "$jwt" | jq -r '.token // empty') \
             || [[ -z "$token" ]]; then
-            log "could not mint an installation token for ${ORG_NAME}; retrying in ${backoff}s"
+            log "could not mint an installation token for ${GH_ORG}; retrying in ${backoff}s"
             write_state error-backoff
             sleep "$backoff"
             backoff=$((backoff < 300 ? backoff * 2 : 300))
             continue
         fi
 
-        # Unique per job: GitHub rejects a name a live registration still holds.
-        name="${RUNNER_NAME}-$(date +%s)"
+        # Unique among registrations that are live at the same moment. A JIT
+        # runner removes itself once its job ends, but "the job ended" and "the
+        # registration is gone" are not the same instant, and the next turn of
+        # this loop can land in between — so the job counter goes in the name,
+        # and the epoch this container started at keeps a restarted Space from
+        # reusing the names the previous one left behind.
+        name="${runner_base}-${boot_epoch}-${jobs_taken}"
         if ! encoded=$(jit_config "$token" "$name") || [[ -z "$encoded" ]]; then
             log "could not get a just-in-time configuration; retrying in ${backoff}s"
             write_state error-backoff

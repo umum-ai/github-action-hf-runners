@@ -79,14 +79,33 @@ The runner joins the runner group `Default` (`runner_group_id: 1`). Organization
 runner groups beyond that one require GitHub Team, so the label — not the group —
 is what a workflow selects on.
 
-The Space passes its inputs in as environment, set by `siam-infra`:
+The Space passes its inputs in as environment. Three come from `siam-infra`, which
+sets them on all three Spaces alike:
 
-| Variable | |
-|---|---|
-| `GH_APP_ID` | `4495616` |
-| `GH_APP_PRIVATE_KEY` | base64 of the App's PEM private key; a PEM cannot travel as a single-line Space secret |
-| `ORG_NAME` | the organization the runner joins |
-| `RUNNER_NAME` | what distinguishes this Space from the other two |
+| | Set as | |
+|---|---|---|
+| `GH_APP_ID` | Space variable | `4495616` |
+| `GH_ORG` | Space variable | the organization the runner joins |
+| `GH_APP_PRIVATE_KEY` | Space secret | base64 of the App's PEM private key; a PEM cannot travel as a single-line Space secret |
+
+That is the whole set, and there is deliberately no fourth. What distinguishes one
+Space from the other two is `SPACE_ID` — `<namespace>/<space>`, which Hugging Face
+injects into every Space itself — so a runner's name is derived rather than
+configured, and no name has to be kept in step in two repositories at once.
+
+A registration is named `<space>-<container start>-<jobs taken>`. Both suffixes
+earn their place: a just-in-time runner removes itself when its job ends, but "the
+job ended" and "the registration is gone" are not the same instant, so the counter
+keeps the next turn of the loop from colliding with a registration still on its way
+out, and the start epoch keeps a restarted Space from reusing the names the
+previous container left behind.
+
+Everything else the supervisor reads — `RUNNER_LABELS`, `RUNNER_GROUP_ID`,
+`RUNNER_WORKDIR`, `APP_PORT`, `STATE_FILE`, `GITHUB_API` — is defaulted in
+[`Dockerfile.space-runner`](Dockerfile.space-runner) and set by nobody. `APP_PORT`
+defaults to 7860 and is the one to watch: a Space's `app_port` is declared in its
+own README front matter by `siam-infra`, and a Space whose front matter names a
+port nothing listens on never leaves the starting stage. Both say 7860.
 
 ### What a Space imposes
 
