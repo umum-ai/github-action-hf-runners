@@ -22,7 +22,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        dockerfile: [Dockerfile.base, Dockerfile.jobs-runner, Dockerfile.space-runner]
+        dockerfile: [Dockerfile.base, Dockerfile.jobs-actions-runner, Dockerfile.space-runner]
     steps:
       - uses: actions/checkout@v4
 
@@ -75,12 +75,19 @@ jobs:
           docker build --file Dockerfile.base --tag "${REGISTRY}/base:${GITHUB_SHA}" .
           ./smoke.sh base "${REGISTRY}/base:${GITHUB_SHA}"
 
-      - name: Build and smoke-test jobs-runner
+      # The name is load-bearing, not cosmetic: the Jobs dispatcher decides whether
+      # an image is prebuilt by testing its reference for the literal substring
+      # `jobs-actions-runner`, before the container starts. A name carrying it runs
+      # `/entrypoint.sh`; any other name makes the dispatcher install a runner
+      # inline as root, which this image — running as `runner` — cannot do, and
+      # every job in the organization fails on `hf-jobs-cpu-upgrade`. The
+      # dispatcher Space is the owner's, so the substring is fixed for us.
+      - name: Build and smoke-test jobs-actions-runner
         run: |
-          docker build --file Dockerfile.jobs-runner \
+          docker build --file Dockerfile.jobs-actions-runner \
             --build-arg "BASE_IMAGE=${REGISTRY}/base:${GITHUB_SHA}" \
-            --tag "${REGISTRY}/jobs-runner:${GITHUB_SHA}" .
-          ./smoke.sh jobs-runner "${REGISTRY}/jobs-runner:${GITHUB_SHA}"
+            --tag "${REGISTRY}/jobs-actions-runner:${GITHUB_SHA}" .
+          ./smoke.sh jobs-actions-runner "${REGISTRY}/jobs-actions-runner:${GITHUB_SHA}"
 
       - name: Build and smoke-test space-runner
         run: |
@@ -104,7 +111,7 @@ jobs:
         env:
           VERSION: ${{ steps.meta.outputs.version }}
         run: |
-          for name in base jobs-runner space-runner; do
+          for name in base jobs-actions-runner space-runner; do
             built="${REGISTRY}/${name}:${GITHUB_SHA}"
             docker tag "${built}" "${REGISTRY}/${name}:latest"
             docker push "${built}"

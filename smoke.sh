@@ -2,9 +2,9 @@
 #
 # Smoke tests for the three images this repository publishes.
 #
-#   ./smoke.sh base         ghcr.io/umum-ai/github-action-hf-runners/base:latest
-#   ./smoke.sh jobs-runner  ghcr.io/umum-ai/github-action-hf-runners/jobs-runner:latest
-#   ./smoke.sh space-runner ghcr.io/umum-ai/github-action-hf-runners/space-runner:latest
+#   ./smoke.sh base                ghcr.io/umum-ai/github-action-hf-runners/base:latest
+#   ./smoke.sh jobs-actions-runner ghcr.io/umum-ai/github-action-hf-runners/jobs-actions-runner:latest
+#   ./smoke.sh space-runner        ghcr.io/umum-ai/github-action-hf-runners/space-runner:latest
 #
 # Every mode runs the base checks — they prove that the tool set the lineage
 # advertises actually works, not that files are present: jq parses, zstd
@@ -14,7 +14,7 @@
 # gets, so a tool that only resolves from shell initialization counts as broken
 # here too.
 #
-# `jobs-runner` adds its entrypoint. `space-runner` adds its supervisor, the
+# `jobs-actions-runner` adds its entrypoint. `space-runner` adds its supervisor, the
 # interpreter and the signing tool it needs, and then starts the image for real
 # and reads its health endpoint from outside the container.
 #
@@ -26,12 +26,12 @@ mode="${1:-}"
 image="${2:-}"
 
 usage() {
-    echo "usage: ./smoke.sh <base|jobs-runner|space-runner> <image-ref>" >&2
+    echo "usage: ./smoke.sh <base|jobs-actions-runner|space-runner> <image-ref>" >&2
     exit 2
 }
 
 case "$mode" in
-    base | jobs-runner | space-runner) ;;
+    base | jobs-actions-runner | space-runner) ;;
     *) usage ;;
 esac
 [ -n "$image" ] || usage
@@ -255,13 +255,13 @@ base_only_checks=$(
 # already knew how to register would make the derived images ambiguous.
 for path in /entrypoint.sh /supervisor.sh /health-server.py; do
     [ ! -e "$path" ] || fail "the base image carries $path" \
-        "registration belongs to jobs-runner and space-runner, not here"
+        "registration belongs to jobs-actions-runner and space-runner, not here"
 done
 pass "the base image carries no runner entrypoint of its own"
 CHECKS
 )
 
-jobs_runner_checks=$(
+jobs_actions_runner_checks=$(
     cat <<'CHECKS'
 
 # --- the Jobs entrypoint ----------------------------------------------------
@@ -307,7 +307,7 @@ CHECKS
 
 case "$mode" in
     base) checks="${shared_checks}${base_only_checks}" ;;
-    jobs-runner) checks="${shared_checks}${jobs_runner_checks}" ;;
+    jobs-actions-runner) checks="${shared_checks}${jobs_actions_runner_checks}" ;;
     space-runner) checks="${shared_checks}${space_runner_checks}" ;;
 esac
 

@@ -6,7 +6,7 @@ one image lineage. This repository builds and publishes all three images of it:
 | Image | What it is |
 |---|---|
 | `ghcr.io/umum-ai/github-action-hf-runners/base` | the toolchain, PostgreSQL 17, the Chromium shared libraries, the `ubuntu-latest` parity utilities and the pinned `actions/runner` release — and nothing about how a runner registers. It has no entrypoint |
-| `ghcr.io/umum-ai/github-action-hf-runners/jobs-runner` | `FROM base` plus [`entrypoint.sh`](entrypoint.sh): the ephemeral Hugging Face Jobs runner. One container, one job, then gone |
+| `ghcr.io/umum-ai/github-action-hf-runners/jobs-actions-runner` | `FROM base` plus [`entrypoint.sh`](entrypoint.sh): the ephemeral Hugging Face Jobs runner. One container, one job, then gone. Its name is not ours to shorten — see "The ephemeral Jobs runner" below |
 | `ghcr.io/umum-ai/github-action-hf-runners/space-runner` | `FROM base` plus [`supervisor.sh`](supervisor.sh) and [`health-server.py`](health-server.py): the long-lived runner that lives in a Hugging Face Space and registers itself for every job |
 
 Every image is published as `:latest` and as `:<commit sha>`; a `v*` tag adds
@@ -41,13 +41,23 @@ mints a one-shot registration token, and starts a Job with the runner image its
 `RUNNER_IMAGE_CPU` variable names. The container registers against the one
 repository the job came from, takes it, and exits.
 
-Two lines in that Space decide which image runs, and both are the owner's to
-change: `RUNNER_IMAGE_CPU`, and the line that recognises an image as prebuilt — it
-matches the literal substring `jobs-actions-runner` in the reference and executes
-`/entrypoint.sh` in it instead of bootstrapping a runner inline. Until both name
-`ghcr.io/umum-ai/github-action-hf-runners/jobs-runner`, Jobs runners keep starting
-from the package `ghcr.io/umum-ai/jobs-actions-runner:latest`, which is no longer
-published from here and is kept in place for exactly that reason.
+The dispatcher picks how to start that container from its name alone, before the
+container runs: a reference containing the literal substring `jobs-actions-runner`
+is treated as a prebuilt runner image and executed through its own
+`/entrypoint.sh`; any other reference is treated as a bare image, and the
+dispatcher installs an `actions/runner` into it inline, with `apt-get`, as root.
+This lineage runs as uid 1000, so an image the dispatcher decides to bootstrap
+fails before the job starts — and that is every job in the organization at once.
+
+That is the whole reason the image is published as
+`ghcr.io/umum-ai/github-action-hf-runners/jobs-actions-runner` and not under a
+tidier name: the substring is the dispatcher's test, the dispatcher Space is a
+duplicate of the upstream [`huggingface/jobs-actions`](https://huggingface.co/spaces/huggingface/jobs-actions)
+Space and belongs to the owner, and nothing in this repository can change how it
+decides. Renaming this image without that substring breaks the whole organization.
+
+`RUNNER_IMAGE_CPU` in that Space is the owner's too, and names the image the
+dispatcher starts: `ghcr.io/umum-ai/github-action-hf-runners/jobs-actions-runner:latest`.
 
 ## The Space runners
 
@@ -209,9 +219,9 @@ passed — the derived images build `FROM` the base that has just passed, not fr
 whatever the registry currently serves.
 
 ```bash
-./smoke.sh base         ghcr.io/umum-ai/github-action-hf-runners/base:latest
-./smoke.sh jobs-runner  ghcr.io/umum-ai/github-action-hf-runners/jobs-runner:latest
-./smoke.sh space-runner ghcr.io/umum-ai/github-action-hf-runners/space-runner:latest
+./smoke.sh base                ghcr.io/umum-ai/github-action-hf-runners/base:latest
+./smoke.sh jobs-actions-runner ghcr.io/umum-ai/github-action-hf-runners/jobs-actions-runner:latest
+./smoke.sh space-runner        ghcr.io/umum-ai/github-action-hf-runners/space-runner:latest
 ```
 
 Every mode runs the base checks, which prove that the advertised tool set *works*
@@ -224,8 +234,8 @@ is unset in both the global and the system git config. They run in a non-login,
 non-interactive shell — the shell a workflow step gets — so a tool that only
 resolves out of shell initialization fails here exactly as it would in a job.
 
-`base` additionally proves it carries no entrypoint of its own. `jobs-runner` proves
-its entrypoint is present, executable and parses. `space-runner` is then *started*:
+`base` additionally proves it carries no entrypoint of its own. `jobs-actions-runner`
+proves its entrypoint is present, executable and parses. `space-runner` is then *started*:
 the checks read its health endpoint over TCP from outside the container, with no
 credentials in the environment, and require that it answers, that it reports
 `misconfigured` rather than dying, that it exposes nothing beyond liveness, job
