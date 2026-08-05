@@ -6,6 +6,8 @@
 # build at the `base` image it has just built and smoke-tested locally, rather
 # than at whatever the registry currently serves.
 ARG BASE_IMAGE=ghcr.io/umum-ai/github-action-hf-runners/base:latest
+# The tag lives in the argument above, whose default carries one.
+# hadolint ignore=DL3006
 FROM ${BASE_IMAGE}
 
 COPY --chown=runner:runner entrypoint.sh /entrypoint.sh
