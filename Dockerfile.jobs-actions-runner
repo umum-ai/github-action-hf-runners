@@ -2,6 +2,13 @@
 # dispatcher executes. It is handed a one-shot registration token, registers
 # against one repository, takes one job and exits with the container.
 #
+# The image this builds is published as
+# `ghcr.io/umum-ai/github-action-hf-runners/jobs-actions-runner`, and the
+# substring `jobs-actions-runner` is the dispatcher's test for a prebuilt image:
+# carrying it is what makes the dispatcher run the `ENTRYPOINT` below instead of
+# installing a runner inline as root, which an image running as uid 1000 cannot
+# survive. The dispatcher Space is the owner's, so the name is fixed for us.
+#
 # `BASE_IMAGE` is a build argument so that the publish workflow can point this
 # build at the `base` image it has just built and smoke-tested locally, rather
 # than at whatever the registry currently serves.

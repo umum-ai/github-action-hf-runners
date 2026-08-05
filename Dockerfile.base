@@ -1,6 +1,6 @@
 # The base of the lineage: the toolchain, the databases, the browser libraries and
 # the `actions/runner` release, for an account at uid 1000. It says nothing about
-# how a runner registers or what starts it — `Dockerfile.jobs-runner` and
+# how a runner registers or what starts it — `Dockerfile.jobs-actions-runner` and
 # `Dockerfile.space-runner` each add that, and this image has no entrypoint of its
 # own.
 FROM ubuntu:24.04
