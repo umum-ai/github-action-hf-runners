@@ -16,8 +16,9 @@ multi-ecosystem-groups:
     labels: ["dependencies"]
 
 updates:
-  # The base image the CI runner is built on. Every job in the organization
-  # runs inside it.
+  # `/` holds all three Dockerfiles of the lineage. What moves here is the
+  # distribution `Dockerfile.base` builds on; every job in the organization runs
+  # inside something derived from it.
   - package-ecosystem: docker
     directory: "/"
     patterns: ["*"]

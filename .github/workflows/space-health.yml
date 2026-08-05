@@ -1,0 +1,72 @@
+name: space-health
+
+# Two things at once. `cpu-basic` hardware stops a Space after 48 hours without
+# inbound traffic and that timer is not configurable, while a runner's own traffic
+# is outbound only — so a Space with nothing but jobs to do would sleep. Reading
+# the health endpoint is the inbound traffic that keeps it awake, and a Space that
+# has stopped answering is reported here instead of being discovered by a job that
+# never starts.
+#
+# It uses no credential: the Spaces are public, and so is this repository.
+
+on:
+  schedule:
+    - cron: "20 */6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  health:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      # Every Space is reported, not just the first one that fails.
+      fail-fast: false
+      matrix:
+        space:
+          - kvokka-space-runner-1
+          - kvokka-space-runner-2
+          - kvokka-space-runner-3
+    steps:
+      - name: Read the health endpoint
+        env:
+          URL: https://${{ matrix.space }}.hf.space/health
+        run: |
+          set -uo pipefail
+
+          # A Space rebuilding after an apply is briefly unreachable, so a single
+          # refusal is not a verdict; five attempts over two minutes is.
+          body=""
+          status=""
+          for attempt in 1 2 3 4 5; do
+            body=$(curl -sS --max-time 20 --write-out '\n%{http_code}' "${URL}" 2>&1) || body=""
+            status="${body##*$'\n'}"
+            if [[ "${status}" == "200" ]]; then
+              break
+            fi
+            echo "attempt ${attempt}: ${URL} -> ${status:-no answer}"
+            sleep 30
+          done
+
+          payload="${body%$'\n'*}"
+
+          if [[ "${status}" != "200" ]]; then
+            echo "::error title=${{ matrix.space }}::${URL} answered ${status:-nothing} after five attempts"
+            echo "${payload}" | head -c 500
+            exit 1
+          fi
+
+          echo "${payload}"
+
+          healthy=$(printf '%s' "${payload}" | jq -r '.healthy // false')
+          if [[ "${healthy}" != "true" ]]; then
+            echo "::error title=${{ matrix.space }}::the Space answers but reports itself unhealthy"
+            exit 1
+          fi
+
+          state=$(printf '%s' "${payload}" | jq -r '.state')
+          taken=$(printf '%s' "${payload}" | jq -r '.jobs_taken')
+          revision=$(printf '%s' "${payload}" | jq -r '.image_revision')
+          echo "::notice title=${{ matrix.space }}::${state}, ${taken} jobs taken, image ${revision}"

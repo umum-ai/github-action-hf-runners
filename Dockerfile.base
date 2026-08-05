@@ -1,3 +1,8 @@
+# The base of the lineage: the toolchain, the databases, the browser libraries and
+# the `actions/runner` release, for an account at uid 1000. It says nothing about
+# how a runner registers or what starts it — `Dockerfile.jobs-runner` and
+# `Dockerfile.space-runner` each add that, and this image has no entrypoint of its
+# own.
 FROM ubuntu:24.04
 
 ARG RUNNER_VERSION=2.336.0
@@ -105,7 +110,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libxshmfence1 \
     && rm -rf /var/lib/apt/lists/*
 
-RUN useradd -m -s /bin/bash runner \
+# `ubuntu:24.04` ships a user `ubuntu` at uid 1000, and a Hugging Face Space runs
+# its container as uid 1000 and nothing else. The uid is freed here and given to
+# `runner`, so a single account owns the home directory, the toolchain and the
+# runner directory in every image of this lineage, on a Space and on a Job alike.
+RUN userdel --remove ubuntu \
+    && useradd -m -u 1000 -s /bin/bash runner \
     && echo "runner ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers.d/runner \
     && mkdir -p /actions-runner /workdir \
     && chown -R runner:runner /actions-runner /workdir
@@ -119,6 +129,10 @@ RUN curl -fsSL -o /tmp/runner.tar.gz \
     && rm /tmp/runner.tar.gz \
     && sudo ./bin/installdependencies.sh \
     && sudo rm -rf /var/lib/apt/lists/*
+
+# What the runner binary answers to `--version`, readable from a step and from
+# the smoke checks without unpacking the release again.
+ENV RUNNER_VERSION=${RUNNER_VERSION}
 
 RUN sh -c "cd $HOME && $(curl -fsLS get.chezmoi.io/lb)" -- init --apply --force --purge-binary kvokka
 
@@ -134,10 +148,3 @@ ENV PATH=/home/runner/.local/share/mise/shims:/home/linuxbrew/.linuxbrew/bin:/ho
 # refuses to run while it is set outside the repository being installed into.
 RUN git config --global --unset-all core.hooksPath || true; \
     sudo git config --system --unset-all core.hooksPath || true
-
-COPY --chown=runner:runner entrypoint.sh /entrypoint.sh
-RUN sudo chmod +x /entrypoint.sh
-
-ENV RUNNER_VERSION=${RUNNER_VERSION}
-
-ENTRYPOINT ["/entrypoint.sh"]

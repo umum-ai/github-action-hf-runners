@@ -1,0 +1,6 @@
+# Worktrees live inside the repository and are never part of it.
+.worktrees/
+.claude/worktrees/
+
+# `python3 -m py_compile` leaves this behind next to the health server.
+__pycache__/
