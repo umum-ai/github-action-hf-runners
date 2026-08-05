@@ -25,10 +25,12 @@ jobs:
       # Every Space is reported, not just the first one that fails.
       fail-fast: false
       matrix:
+        # The Space host is `<namespace>-<name>.hf.space`. `siam-infra` creates
+        # these Spaces and so owns what they are called; this list follows it.
         space:
-          - kvokka-space-runner-1
-          - kvokka-space-runner-2
-          - kvokka-space-runner-3
+          - kvokka-siam-gha-runner-1
+          - kvokka-siam-gha-runner-2
+          - kvokka-siam-gha-runner-3
     steps:
       - name: Read the health endpoint
         env:

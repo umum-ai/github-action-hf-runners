@@ -51,10 +51,10 @@ published from here and is kept in place for exactly that reason.
 
 ## The Space runners
 
-Three Hugging Face Spaces in the `kvokka` namespace — `space-runner-1`,
-`space-runner-2` and `space-runner-3` — each run the `space-runner` image on
-`cpu-basic` hardware. They are created and configured by `siam-infra`, not from
-here.
+Three Hugging Face Spaces in the `kvokka` namespace — `siam-gha-runner-1`,
+`siam-gha-runner-2` and `siam-gha-runner-3` — each run the `space-runner` image on
+`cpu-basic` hardware. They are created and configured by `siam-infra`, which is
+where their names come from too.
 
 Registration is nothing like the Jobs runner's. There is no dispatcher and no
 webhook: the container holds a GitHub App credential and registers *itself*,
@@ -98,7 +98,7 @@ Four rules, all load-bearing:
   before anything else and outlives every registration:
 
   ```console
-  $ curl https://kvokka-space-runner-1.hf.space/
+  $ curl https://kvokka-siam-gha-runner-1.hf.space/
   {"healthy":true,"image_revision":"9f1c...","jobs_taken":4,"runner_alive":true,"state":"waiting-for-job","uptime_seconds":51840}
   ```
 
