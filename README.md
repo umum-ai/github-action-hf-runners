@@ -128,16 +128,42 @@ Four rules, all load-bearing:
 
   ```console
   $ curl https://kvokka-siam-gha-runner-1.hf.space/
-  {"healthy":true,"image_revision":"9f1c...","jobs_taken":4,"runner_alive":true,"state":"waiting-for-job","uptime_seconds":51840}
+  {"healthy":true,"image_revision":"9f1c...","jobs_taken":4,"reason":null,"runner_alive":true,"state":"waiting-for-job","uptime_seconds":51840}
   ```
 
   `/` always answers 200 — that is the liveness the platform probes, and a container
   that cannot register must still be reachable to be diagnosed at all. `/health`
   answers 200 only while the runner is actually able to take a job, and 503
   otherwise. These Spaces are public, because a private one could only be probed
-  with a token this repository is not allowed to hold, so the payload is three facts
+  with a token this repository is not allowed to hold, so the payload is four facts
   and nothing else: whether the supervisor is alive, how many jobs this container
-  has taken, and the commit its image was built from.
+  has taken, the commit its image was built from, and `reason`.
+
+  `reason` is why the runner is not working, and null while it is. A Space that
+  cannot take a job says so where anyone can read it, because the only other place
+  that says it — the Space's own run log — needs an owner token:
+
+  ```console
+  $ curl https://kvokka-siam-gha-runner-1.hf.space/
+  {"healthy":false,"image_revision":"a83d...","jobs_taken":0,"reason":"GH_APP_PRIVATE_KEY is not the base64 of a PEM private key","runner_alive":true,"state":"misconfigured","uptime_seconds":233}
+  ```
+
+  It is one of four sentences, all of them literals of
+  [`supervisor.sh`](supervisor.sh):
+
+  | State | `reason` |
+  |---|---|
+  | `misconfigured` | `required environment variables are not set: <names>` |
+  | `misconfigured` | `GH_APP_PRIVATE_KEY is not the base64 of a PEM private key` |
+  | `error-backoff` | `the GitHub API did not return an installation token for this organization` |
+  | `error-backoff` | `the GitHub API did not return a just-in-time runner configuration` |
+
+  What a reason may say is bounded by the endpoint being public and
+  unauthenticated: which variable is unset, what *shape* a credential failed to
+  have, or what the GitHub API did not return. Never anything derived from a
+  credential's value — not a prefix, not a length, not a hash — and never a body an
+  API sent back. [`smoke.sh`](smoke.sh) starts the image with an unusable key and
+  fails if any part of that value reaches the payload.
 
 - **The application runs as uid 1000, never root.** `ubuntu:24.04` already ships a
   user at that uid; [`Dockerfile.base`](Dockerfile.base) removes it and gives the uid
@@ -235,11 +261,15 @@ non-interactive shell — the shell a workflow step gets — so a tool that only
 resolves out of shell initialization fails here exactly as it would in a job.
 
 `base` additionally proves it carries no entrypoint of its own. `jobs-actions-runner`
-proves its entrypoint is present, executable and parses. `space-runner` is then *started*:
-the checks read its health endpoint over TCP from outside the container, with no
-credentials in the environment, and require that it answers, that it reports
-`misconfigured` rather than dying, that it exposes nothing beyond liveness, job
-count and image revision, and that `/` answers 200 while `/health` answers 503.
+proves its entrypoint is present, executable and parses. `space-runner` is then
+*started*, twice, and its health endpoint read over TCP from outside the container
+each time. With no credentials in the environment it has to answer, report
+`misconfigured` rather than dying, name every unset variable in its `reason`,
+expose nothing beyond liveness, job count, image revision and that reason, and
+answer 200 on `/` while `/health` answers 503. With every variable set but a
+`GH_APP_PRIVATE_KEY` that is not the base64 of a PEM, its `reason` has to be
+exactly that sentence — and no part of the value handed in may appear anywhere in
+the payload.
 
 [`.hadolint.yaml`](.hadolint.yaml) lints the three Dockerfiles, `shellcheck` the
 three shell scripts, and the health server has to compile — all before any image is
@@ -249,7 +279,9 @@ built.
 
 [`space-health.yml`](.github/workflows/space-health.yml) reads the health endpoint of
 all three Spaces every six hours and fails on any that does not answer, or that
-answers while reporting itself unhealthy. It uses no credential.
+answers while reporting itself unhealthy. A failure carries the `reason` the Space
+gave in its own annotation, so a failed run names the cause on its face instead of
+sending a reader to a log they need an owner token to open. It uses no credential.
 
 The schedule is not only a monitor: `cpu-basic` hardware stops a Space after 48
 hours with no inbound traffic, that timer is not configurable, and a runner's own
