@@ -7,6 +7,11 @@ name: space-health
 # has stopped answering is reported here instead of being discovered by a job that
 # never starts.
 #
+# Every Space this organization's CI stands on is read here, and there are two
+# kinds: the three long-lived runner Spaces, and the one dispatcher Space that
+# turns an `hf-jobs-*` label into a Hugging Face Job. They answer different
+# endpoints and are therefore two jobs rather than one matrix.
+#
 # It uses no credential: the Spaces are public, and so is this repository.
 
 on:
@@ -78,3 +83,59 @@ jobs:
           taken=$(printf '%s' "${payload}" | jq -r '.jobs_taken')
           revision=$(printf '%s' "${payload}" | jq -r '.image_revision')
           echo "::notice title=${{ matrix.space }}::${state}, ${taken} jobs taken, image ${revision}"
+
+  # The dispatcher is not a runner and holds no runner image: it is the Space
+  # GitHub delivers `workflow_job` to, and the only thing that turns an
+  # `hf-jobs-*` label into a Hugging Face Job. It sleeps on the same terms as the
+  # runners and matters more when it does — a webhook that arrives at a sleeping
+  # Space is not what wakes it in time, so the job it announced stays queued
+  # until someone reruns the workflow or redelivers the delivery. This read is
+  # the inbound traffic that keeps that from happening.
+  dispatcher:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Read the dispatcher's health endpoint
+        env:
+          # `<namespace>-<name>.hf.space`, like the runners above. The
+          # dispatcher lives in the same personal namespace, because that is the
+          # account whose plan may create Spaces.
+          URL: https://kvokka-jobs-actions-dispatcher.hf.space/healthz
+        run: |
+          set -uo pipefail
+
+          # A sleeping Space answers nothing until it has started, and starting
+          # is the normal outcome of this request rather than a fault, so the
+          # first attempt is given a full minute and four more follow it.
+          body=""
+          status=""
+          for attempt in 1 2 3 4 5; do
+            body=$(curl -sS --max-time 60 --write-out '\n%{http_code}' "${URL}" 2>&1) || body=""
+            status="${body##*$'\n'}"
+            if [[ "${status}" == "200" ]]; then
+              break
+            fi
+            echo "attempt ${attempt}: ${URL} -> ${status:-no answer}"
+            sleep 30
+          done
+
+          payload="${body%$'\n'*}"
+
+          if [[ "${status}" != "200" ]]; then
+            echo "::error title=dispatcher::${URL} answered ${status:-nothing} after five attempts — every job on an hf-jobs-* label stays queued while this is true"
+            echo "${payload}" | head -c 500
+            exit 1
+          fi
+
+          echo "${payload}"
+
+          # `ok` or `needs-config`. The second one is a dispatcher that is up and
+          # will still take no work, which is exactly the failure this workflow
+          # exists to catch before a job does.
+          reported=$(printf '%s' "${payload}" | jq -r '.status // empty')
+          if [[ "${reported}" != "ok" ]]; then
+            echo "::error title=dispatcher::the Space answers and reports \`${reported:-no status}\` — it dispatches nothing until its GitHub App settings are complete"
+            exit 1
+          fi
+
+          echo "::notice title=dispatcher::${reported}, awake and configured"
