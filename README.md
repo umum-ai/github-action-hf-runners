@@ -287,6 +287,19 @@ The schedule is not only a monitor: `cpu-basic` hardware stops a Space after 48
 hours with no inbound traffic, that timer is not configurable, and a runner's own
 traffic is outbound only. This is the inbound traffic.
 
+The same run reads one more Space, which carries no image of this repository: the
+dispatcher at `kvokka/jobs-actions-dispatcher`, the Space GitHub delivers
+`workflow_job` to and the only thing that turns an `hf-jobs-*` label into a
+Hugging Face Job. Its `/healthz` answers `{"status":"ok"}` when it is configured
+and `needs-config` when its GitHub App settings are not, and both are judged: a
+dispatcher that is up and unconfigured dispatches nothing.
+
+It sleeps on the same 48-hour terms and matters more when it does. A webhook
+arriving at a sleeping Space is not what wakes it in time — the job it announced
+stays queued until the workflow is rerun or the delivery is redelivered. That is
+what this read prevents, and it is why a job that sits queued forever on an
+`hf-jobs-*` label is worth checking here first.
+
 ## Bumping the runner version
 
 Change `ARG RUNNER_VERSION` in [`Dockerfile.base`](Dockerfile.base) to a release tag
