@@ -33,9 +33,14 @@ runner already up: nothing is started, the container is waiting.
 
 ## The ephemeral Jobs runner
 
-A [GitHub App](https://github.com/organizations/umum-ai/settings/apps/huggingface-runners),
-installed organization-wide, delivers `workflow_job.queued` webhooks to the
-dispatcher Space at <https://huggingface.co/spaces/kvokka/jobs-actions-dispatcher>.
+The GitHub App [`huggingface-jobs-runners`](https://github.com/organizations/umum-ai/settings/apps/huggingface-jobs-runners),
+installed organization-wide, delivers `workflow_job` webhooks to the dispatcher
+Space at <https://huggingface.co/spaces/kvokka/jobs-actions-dispatcher>. Neither
+belongs to this repository and neither is applied by anything: both were made to
+exist once, by hand, and
+["Bootstrap: what a human made exist"](#bootstrap-what-a-human-made-exist) says
+what they are and what falls silent without them.
+
 The dispatcher translates the `hf-jobs-*` label into a Hugging Face Jobs flavor,
 mints a one-shot registration token, and starts a Job with the runner image its
 `RUNNER_IMAGE_CPU` variable names. The container registers against the one
@@ -71,7 +76,8 @@ webhook: the container holds a GitHub App credential and registers *itself*,
 against the organization rather than a repository. Its App is
 `umum-ai/huggingface-space-runners`, app id `4495616`, and its only permission is
 `organization_self_hosted_runners: write` — enough for the two endpoints below and
-nothing else.
+nothing else. The Spaces are `siam-infra`'s; the App is not, and is named with the
+rest of the bootstrap at the end of this file.
 
 [`supervisor.sh`](supervisor.sh) loops:
 
@@ -322,9 +328,65 @@ There is also no `/opt/hostedtoolcache`, so `actions/setup-node`,
 toolchain on every run instead of finding a preinstalled copy. Where that hurts,
 prefer mise (already present) over `actions/setup-*`.
 
-## Package visibility
+## Bootstrap: what a human made exist
 
-Hugging Face pulls these images anonymously, so every GHCR package must be public. A
-package published private is fixed at
-<https://github.com/orgs/umum-ai/packages> — open it and, under
-**Danger Zone → Change package visibility**, set it to **Public**.
+Across this organization infrastructure is applied by terraform, through Digger.
+What a human does by hand is bring an identity into existence and grant it its
+rights — and nothing else. A paragraph that tells a reader to go and configure
+something is a defect rather than a procedure: a grant that lives in prose is a
+grant nobody applies.
+
+Four things this repository depends on were made that way, and these are all of
+them. Three are identities. The fourth is the one property GitHub exposes through
+no API at all.
+
+| What | Whose | What stops without it |
+|---|---|---|
+| GitHub App `huggingface-jobs-runners` | the organization's | a queued job on `hf-jobs-cpu-upgrade` is never announced to anything |
+| the dispatcher Space `kvokka/jobs-actions-dispatcher` | the owner's Hugging Face account | an announced job is never turned into a container |
+| GitHub App `huggingface-space-runners` | the organization's | the three Spaces cannot register, so `hf-spaces` takes no job |
+| the three GHCR packages being public | this repository's | no runner image can be pulled, on either label |
+
+**`huggingface-jobs-runners`**, app id `4426974`, is installed on every repository
+in the organization, subscribes to exactly one event — `workflow_job` — and holds
+`actions: write`, `administration: write` and `metadata: read`; `administration`
+is what lets a registration token be minted for the repository a job came from.
+Its webhook posts to the dispatcher Space. Without it a queued job is never
+announced at all: nothing fails, no run turns red, and every job on an `hf-jobs-*`
+label waits until someone cancels it.
+
+**The dispatcher Space** is a duplicate of the upstream
+[`huggingface/jobs-actions`](https://huggingface.co/spaces/huggingface/jobs-actions)
+Space in the owner's own Hugging Face namespace, where it starts Jobs on the
+owner's account. Nothing in this organization creates it, configures it or can
+change how it decides anything — including the substring test that fixes this
+image's name. Its `RUNNER_IMAGE_CPU` variable is the owner's too and names the
+image it starts. Gone, asleep or unconfigured, it makes webhooks arrive nowhere,
+which is the same silence as above and is why
+[`space-health.yml`](.github/workflows/space-health.yml) reads its `/healthz`
+beside the runners' own.
+
+**`huggingface-space-runners`**, app id `4495616`, holds the single permission
+`organization_self_hosted_runners: write`. Its private key is the credential the
+three Spaces carry, and `siam-infra` is what puts that key into them; only the
+App's existence and that one grant are hand-made. Without the App a Space stays
+up and reachable and reports `error-backoff` with `the GitHub API did not return
+an installation token for this organization`.
+
+**A package's visibility has no API.** Hugging Face pulls these images
+anonymously, so all three GHCR packages must be public — and a package name
+published for the first time starts out private, because a package inherits the
+*access permissions* of the repository it is linked to and not its visibility.
+Nothing can change that from a workflow: the REST endpoints for packages list,
+read, delete and restore packages and their versions and do no more, the GraphQL
+schema's only package mutation is `deletePackageVersion`, and GitHub's own
+documentation sends a reader to the package's own settings page. That is the
+narrow exception, named — it is spent once per package name, and the three names
+that exist are public today.
+
+That last one is proved rather than trusted. After every push to GHCR,
+[`publish.yml`](.github/workflows/publish.yml) asks each of the three packages for
+its tag list the way Hugging Face asks — anonymously, holding no credential — and
+fails naming the package that answers anything but 200. A package left private
+therefore turns red the publish that created it, instead of surfacing later as a
+pull failure inside somebody else's job.
