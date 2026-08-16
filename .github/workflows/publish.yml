@@ -120,3 +120,31 @@ jobs:
               docker push "${REGISTRY}/${name}:${VERSION}"
             fi
           done
+
+      # Hugging Face pulls these images with no credential, and a package name
+      # published for the first time is private: a package inherits the access
+      # permissions of its linked repository, not its visibility, and GitHub
+      # exposes visibility through no API — see "Bootstrap" in the README. So the
+      # state is read the way Hugging Face reads it, anonymously, and a private
+      # package turns this run red instead of failing inside somebody else's job.
+      - name: Prove every package is pullable with no credential
+        if: env.PUBLISH == 'true'
+        run: |
+          private=()
+          for name in base jobs-actions-runner space-runner; do
+            path="${REGISTRY#ghcr.io/}/${name}"
+            # Not `curl -f`: for a package it may not read, the token endpoint
+            # answers 403, and that is an answer to report rather than an error to
+            # die on. No token leaves the request unauthorized, which is a 401 below.
+            token="$(curl -sS --retry 3 --retry-all-errors \
+              "https://ghcr.io/token?service=ghcr.io&scope=repository:${path}:pull" \
+              | jq -r '.token // empty')"
+            code="$(curl -sS --retry 3 --retry-all-errors -o /dev/null -w '%{http_code}' \
+              -H "Authorization: Bearer ${token}" "https://ghcr.io/v2/${path}/tags/list")"
+            echo "${path}: ${code}"
+            [[ "${code}" == "200" ]] || private+=("${path}")
+          done
+          if [[ ${#private[@]} -gt 0 ]]; then
+            echo "::error::not readable anonymously: ${private[*]} — these packages must be public, and visibility is set on the package itself, once per package name"
+            exit 1
+          fi
