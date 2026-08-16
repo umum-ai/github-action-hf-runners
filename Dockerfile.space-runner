@@ -14,7 +14,7 @@ FROM ${BASE_IMAGE}
 # Space can be told apart from the image the registry currently serves.
 ARG IMAGE_REVISION=unknown
 
-USER root
+USER 0
 
 # `openssl` signs the GitHub App JWT and `python3` runs the health server. Both
 # belong to this image rather than to the base: they are what being a Space costs,
