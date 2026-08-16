@@ -120,7 +120,8 @@ RUN userdel --remove ubuntu \
     && mkdir -p /actions-runner /workdir \
     && chown -R runner:runner /actions-runner /workdir
 
-USER runner
+# Use the numeric uid that both Hugging Face and this image assign to `runner`.
+USER 1000
 WORKDIR /actions-runner
 
 RUN curl -fsSL -o /tmp/runner.tar.gz \
