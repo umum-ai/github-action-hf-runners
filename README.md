@@ -9,8 +9,8 @@ one image lineage. This repository builds and publishes all three images of it:
 | `ghcr.io/umum-ai/github-action-hf-runners/jobs-actions-runner` | `FROM base` plus [`entrypoint.sh`](entrypoint.sh): the ephemeral Hugging Face Jobs runner. One container, one job, then gone. Its name is not ours to shorten — see "The ephemeral Jobs runner" below |
 | `ghcr.io/umum-ai/github-action-hf-runners/space-runner` | `FROM base` plus [`supervisor.sh`](supervisor.sh) and [`health-server.py`](health-server.py): the long-lived runner that lives in a Hugging Face Space and registers itself for every job |
 
-Every image is published as `:latest` and as `:<commit sha>`; a `v*` tag adds
-`:<tag>`. Nothing is pushed that has not passed [`smoke.sh`](smoke.sh) first — see
+Every image is published as `:latest` and as `:<commit sha>`; an `X.Y.Z` tag
+adds `:<tag>`. Nothing is pushed that has not passed [`smoke.sh`](smoke.sh) first — see
 [`.github/workflows/publish.yml`](.github/workflows/publish.yml), which runs on
 `ubuntu-latest` because building an image needs a docker daemon and neither of
 these runners has one.

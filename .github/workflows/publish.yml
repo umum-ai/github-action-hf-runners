@@ -3,7 +3,9 @@ name: publish
 on:
   push:
     branches: [main]
-    tags: ["v*"]
+    # A release of these images is a tag of the form every artifact of this
+    # organization takes; the step below publishes for nothing else.
+    tags: ["[0-9]*"]
   workflow_dispatch:
 
 permissions:
@@ -49,9 +51,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 90
     env:
-      # `main` and `v*` tags are the refs that reach GHCR. Every other ref still
+      # `main` and version tags are the refs that reach GHCR. Every other ref still
       # builds all three images and runs the smoke tests, it just keeps the result.
-      PUBLISH: ${{ github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v') }}
+      PUBLISH: ${{ github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/') }}
       REGISTRY: ghcr.io/${{ github.repository }}
     steps:
       - uses: actions/checkout@v7
@@ -60,7 +62,7 @@ jobs:
         id: meta
         run: |
           version=""
-          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+          if [[ "${GITHUB_REF}" =~ ^refs/tags/[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
             version="${GITHUB_REF#refs/tags/}"
           fi
           echo "version=${version}" >> "$GITHUB_OUTPUT"
