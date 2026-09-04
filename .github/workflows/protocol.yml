@@ -1,0 +1,45 @@
+name: protocol
+
+on:
+  workflow_dispatch:
+  # a pull request nothing else touches is still reached, so a review that
+  # never arrives is asked for again rather than waited on
+  schedule:
+    - cron: "*/30 * * * *"
+  issue_comment:
+    types: [created]
+  pull_request:
+    types: [opened, synchronize, ready_for_review]
+
+permissions:
+  contents: read
+  issues: write
+  pull-requests: write
+
+concurrency:
+  group: protocol-${{ github.event_name }}-${{ github.event.issue.number || github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  nudge:
+    # A fork's `pull_request` gives the run a read-only token and this job
+    # writes, so only a head in this repository enters here; the `schedule` run
+    # reaches a fork's pull request with the base repository's token instead.
+    # An `issues` event is about an issue and no pull request waits on it; the
+    # gate SI-0336 adds is what answers those.
+    if: >-
+      github.event_name != 'issues' &&
+      (github.event_name != 'pull_request' ||
+       github.event.pull_request.head.repo.full_name == github.repository)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # Every run of this job reads and writes every open pull request, so one
+    # group holds them all: keying on the event would let a schedule run and a
+    # comment run at once and post the same nudge twice.
+    concurrency:
+      group: review-nudge
+      cancel-in-progress: false
+    steps:
+      # `ubuntu-latest` carries `python3` and `gh`, which is everything the rule
+      # and the action's steps need; this repository has no mise tool set
+      - uses: umum-ai/siam-platform/.github/actions/review-nudge@1.8.0
